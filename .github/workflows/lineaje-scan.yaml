@@ -1,0 +1,30 @@
+name: Lineaje AI Policy Scan
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  lineaje-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install mcp
+
+      - name: Run Lineaje AI policy scan
+        env:
+          LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
+        run: python scripts/gha_repo_scan.py --source-path . | tee scan_result.json
+
+      - name: Log scan result
+        run: cat scan_result.json
