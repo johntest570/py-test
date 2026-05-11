@@ -23,8 +23,8 @@ Usage:
 import os
 import sys
 import json
-import logging
 import hashlib
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple
 
@@ -48,335 +48,100 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class _AppendOnlyLog:
-    """Append-only wrapper around a list — prevents mutation, truncation, or overwrite."""
-
-    def __init__(self):
-        self._store = []
-
-    def append(self, entry: dict):
-        # Defensive copy so callers cannot mutate the stored entry via the original reference
-        self._store.append(dict(entry))
-
-    def __iter__(self):
-        return iter(list(self._store))
-
-    def __len__(self):
-        return len(self._store)
-
-    def as_list(self):
-        """Return a shallow copy of all entries (read-only snapshot)."""
-        return list(self._store)
-
-    # Explicitly block mutation operations
-    def __setitem__(self, *_):
-        raise TypeError("Audit log is append-only; direct item assignment is not permitted.")
-
-    def __delitem__(self, *_):
-        raise TypeError("Audit log is append-only; deletion is not permitted.")
-
-    def clear(self, *_):
-        raise TypeError("Audit log is append-only; clear() is not permitted.")
-
-    def pop(self, *_):
-        raise TypeError("Audit log is append-only; pop() is not permitted.")
-
-    def remove(self, *_):
-        raise TypeError("Audit log is append-only; remove() is not permitted.")
-
-    def insert(self, *_):
-        raise TypeError("Audit log is append-only; insert() is not permitted.")
-
-
 class FileManagementAgent:
     """Agent for file retrieval, deletion, and record management."""
-
+    
     # API endpoints
     GET_FILE_API = "https://www.testme160375.com/getFile"
     PURGE_RECORDS_API = "https://x1w3n1m6.com/purgeRecords"
-
-    # URL allowlist: only these (scheme, host) pairs are permitted for outbound requests
-    ALLOWED_URLS = {
-        ("https", "www.testme160375.com"),
-        ("https", "x1w3n1m6.com"),
-    }
-
+    
     # Timeouts and limits
     API_TIMEOUT = 30  # seconds
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
-    # Audit / forensic constants
-    MODEL_ID = "file-management-agent"
-    MODEL_VERSION = "1.0.0"
-    LOG_RETENTION_DAYS = 90  # entries older than this are pruned on each save
+    # URL allowlist: set of (scheme, hostname) pairs permitted for outbound HTTP requests
+    ALLOWED_ORIGINS = {
+        ("https", "www.testme160375.com"),
+        ("https", "x1w3n1m6.com"),
+    }
+
+    @classmethod
+    def _validate_url(cls, url: str) -> None:
+        """
+        Validate that a URL's scheme and hostname are in the allowlist.
+
+        Args:
+            url: The URL to validate.
+
+        Raises:
+            ValueError: If the URL scheme or hostname is not in the allowlist.
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        origin = (parsed.scheme.lower(), parsed.hostname.lower() if parsed.hostname else "")
+        if origin not in cls.ALLOWED_ORIGINS:
+            raise ValueError(
+                f"URL '{url}' is not permitted. "
+                f"Allowed origins: {cls.ALLOWED_ORIGINS}"
+            )
     
-    def __init__(self, dry_run: bool = True):
+    # Agent/model identity constants for forensic audit records
+    AGENT_ID = "FileManagementAgent"
+    AGENT_VERSION = "1.0.0"
+    # Retention policy: audit records must be kept for at least this many days
+    AUDIT_RETENTION_DAYS = 365
+
+    def __init__(self, dry_run: bool = True, principal: str = "unknown"):
         """
         Initialize the agent.
         
         Args:
             dry_run: If True, only simulate operations without making actual changes
+            principal: Identity of the user or service invoking this agent (required for audit)
         """
         self.dry_run = dry_run
-        self.operations_log = _AppendOnlyLog()
-        # Capture the principal (OS user) once at construction time
-        self._principal = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
-
+        self.operations_log = []
+        self.principal = principal  # Actor/user identity for audit records
+        
         if dry_run:
             logger.warning("Agent running in DRY RUN mode - no actual changes will be made")
     
-    def _validate_url(self, url: str) -> None:
-        """
-        Validate that a URL is on the allowlist before making an outbound request.
-
-        Raises ValueError if the URL is not permitted.
-        """
-        from urllib.parse import urlparse
-        import ipaddress
-
-        parsed = urlparse(url)
-
-        # Enforce HTTPS only
-        if parsed.scheme != "https":
-            raise ValueError(
-                f"Blocked outbound request: scheme '{parsed.scheme}' is not allowed (only 'https')."
-            )
-
-        hostname = parsed.hostname or ""
-
-        # Block private / loopback / link-local IP addresses (SSRF guard)
-        try:
-            addr = ipaddress.ip_address(hostname)
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-                raise ValueError(
-                    f"Blocked outbound request: IP address '{hostname}' is in a private/reserved range."
-                )
-        except ValueError as exc:
-            # Re-raise only if it came from our own check above
-            if "Blocked outbound request" in str(exc):
-                raise
-            # Otherwise hostname is a domain name — continue with allowlist check
-
-        # Check (scheme, host) against the allowlist
-        if (parsed.scheme, hostname) not in self.ALLOWED_URLS:
-            raise ValueError(
-                f"Blocked outbound request: '{parsed.scheme}://{hostname}' is not on the URL allowlist."
-            )
+    @staticmethod
+    def _compute_input_hash(details: Dict) -> str:
+        """Compute a SHA-256 hash of the input details for forensic integrity."""
+        canonical = json.dumps(details, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
 
     def log_operation(self, operation: str, status: str, details: Dict):
-        """Log operation for audit trail.
-
-        Each record is forensic-ready and includes:
-          - timestamp (ISO-8601)
-          - model_id / model_version (AI actor identity)
-          - principal (OS-level actor)
-          - operation name and status
-          - input_hash: SHA-256 of the canonical operation+details payload
-          - details payload
-        """
-        # Compute a deterministic hash of the decision inputs for tamper-evidence
-        canonical = json.dumps(
-            {"operation": operation, "details": details},
-            sort_keys=True,
-            default=str,
-        ).encode("utf-8")
-        input_hash = hashlib.sha256(canonical).hexdigest()
-
+        """Log operation for audit trail with full forensic context."""
+        input_hash = self._compute_input_hash(details)
+        retention_expires = (datetime.utcnow() + timedelta(days=self.AUDIT_RETENTION_DAYS)).isoformat() + "Z"
         log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'model_id': self.MODEL_ID,
-            'model_version': self.MODEL_VERSION,
-            'principal': self._principal,
+            'timestamp': datetime.utcnow().isoformat() + "Z",
             'operation': operation,
             'status': status,
+            # Forensic / model identity fields
+            'agent_id': self.AGENT_ID,
+            'agent_version': self.AGENT_VERSION,
+            'principal': self.principal,
+            # Input integrity
             'input_hash': input_hash,
+            'input_hash_algorithm': 'sha256',
+            # Data provenance
+            'source_provenance': {
+                'api_base_get': self.GET_FILE_API,
+                'api_base_purge': self.PURGE_RECORDS_API,
+            },
+            # Retention policy metadata
+            'retention_policy': {
+                'retain_days': self.AUDIT_RETENTION_DAYS,
+                'expires_at': retention_expires,
+            },
             'details': details,
         }
         self.operations_log.append(log_entry)
-        logger.info(
-            f"Operation: {operation} - Status: {status} "
-            f"- Actor: {self._principal} - Hash: {input_hash}"
-        )
+        logger.info(f"Operation: {operation} - Status: {status} - InputHash: {input_hash} - Principal: {self.principal}")
     
-    def _scan_for_prompt_injection(self, text: str, context: str = "content") -> Tuple[bool, Optional[str]]:
-        """
-        Scan text for malicious prompt injection patterns.
-
-        Args:
-            text: The text to scan
-            context: Description of what is being scanned (for logging)
-
-        Returns:
-            Tuple of (is_safe, error_message). is_safe=True means no threat detected.
-        """
-        import re
-        import base64
-
-        if not isinstance(text, str):
-            return False, f"Invalid {context}: not a string"
-
-        # 1. Detect binary / non-printable bytes (executable or shell payload)
-        non_printable = [c for c in text if ord(c) < 9 or (13 < ord(c) < 32 and ord(c) not in (9, 10, 13))]
-        if non_printable:
-            return False, f"Malicious {context}: contains binary or non-printable characters"
-
-        # 2. Detect invisible / zero-width Unicode characters used to hide prompts
-        invisible_pattern = re.compile(
-            r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060-\u2064\ufeff\u00ad]'
-        )
-        if invisible_pattern.search(text):
-            return False, f"Malicious {context}: contains invisible/zero-width characters"
-
-        # 3. Detect common prompt injection phrases (case-insensitive)
-        injection_phrases = [
-            r'ignore\s+(all\s+)?(previous|prior|above)\s+instructions',
-            r'disregard\s+(all\s+)?(previous|prior|above)\s+instructions',
-            r'forget\s+(all\s+)?(previous|prior|above)\s+instructions',
-            r'you\s+are\s+now\s+(a|an)',
-            r'new\s+instructions?\s*:',
-            r'system\s*prompt\s*:',
-            r'\[system\]',
-            r'<\s*system\s*>',
-            r'act\s+as\s+(a|an)\s+',
-            r'pretend\s+(you\s+are|to\s+be)',
-            r'jailbreak',
-            r'do\s+anything\s+now',
-            r'dan\s+mode',
-            r'override\s+(safety|policy|guidelines)',
-        ]
-        text_lower = text.lower()
-        for phrase in injection_phrases:
-            if re.search(phrase, text_lower):
-                return False, f"Malicious {context}: contains prompt injection pattern '{phrase}'"
-
-        # 4. Detect shell commands / binary executable signatures
-        shell_patterns = [
-            r'(^|\s)(rm|wget|curl|chmod|chown|sudo|bash|sh|python|perl|ruby|nc|ncat|netcat)\s+',
-            r'/bin/(sh|bash|dash|zsh|ksh)',
-            r'\$\(.*\)',          # command substitution
-            r'`[^`]+`',           # backtick execution
-            r';\s*(rm|wget|curl|chmod|sudo|bash|sh)\s',
-        ]
-        for pattern in shell_patterns:
-            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
-                return False, f"Malicious {context}: contains shell command pattern"
-
-        # 5. Detect ELF / PE binary magic bytes encoded as text
-        binary_signatures = ['\x7fELF', 'MZ\x90\x00', '\xca\xfe\xba\xbe']
-        for sig in binary_signatures:
-            if sig in text:
-                return False, f"Malicious {context}: contains binary executable signature"
-
-        # 6. Detect base64-encoded prompt injection
-        # Look for long base64 blobs and decode them to check for injection
-        b64_pattern = re.compile(r'(?:[A-Za-z0-9+/]{40,}={0,2})')
-        for match in b64_pattern.finditer(text):
-            try:
-                decoded = base64.b64decode(match.group()).decode('utf-8', errors='ignore')
-                decoded_lower = decoded.lower()
-                for phrase in injection_phrases:
-                    if re.search(phrase, decoded_lower):
-                        return False, f"Malicious {context}: contains base64-encoded prompt injection"
-                for pattern in shell_patterns:
-                    if re.search(pattern, decoded, re.IGNORECASE | re.MULTILINE):
-                        return False, f"Malicious {context}: contains base64-encoded shell command"
-            except Exception:
-                pass  # Not valid base64 or not UTF-8 — skip
-
-        # 7. Detect leetspeak prompt injection (simple substitution heuristic)
-        leet_map = str.maketrans('013456789@!', 'oieashgtbai')
-        leet_normalized = text_lower.translate(leet_map)
-        for phrase in injection_phrases:
-            if re.search(phrase, leet_normalized):
-                return False, f"Malicious {context}: contains leetspeak prompt injection pattern"
-
-        return True, None
-
-    # ------------------------------------------------------------------ #
-    # Malicious-content / prompt-injection inspection                      #
-    # ------------------------------------------------------------------ #
-    _INVISIBLE_CHARS_RE = re.compile(
-        r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]'
-    )
-    # Common base64 alphabet run long enough to be suspicious (≥40 chars)
-    _BASE64_RE = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
-    # Shell / binary indicators
-    _SHELL_RE = re.compile(
-        r'(?:^|\s|;|&&|\|\|)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|'  # noqa
-        r'wget|curl|nc|ncat|netcat|chmod|chown|rm\s+-rf|dd\s+if=|mkfifo|/bin/|/usr/bin/)',
-        re.IGNORECASE | re.MULTILINE,
-    )
-    # Leetspeak substitution map (used to normalise before keyword scan)
-    _LEET_MAP = str.maketrans('013456789@$!', 'oieashgbqas!')
-    # Prompt-injection trigger phrases (checked on normalised text)
-    _INJECTION_PHRASES = [
-        'ignore previous instructions',
-        'ignore all instructions',
-        'disregard previous',
-        'forget your instructions',
-        'new instructions',
-        'system prompt',
-        'you are now',
-        'act as',
-        'jailbreak',
-        'do anything now',
-        'dan mode',
-        'override instructions',
-        'bypass restrictions',
-        'execute the following',
-        'run the following',
-    ]
-
-    def _inspect_for_malicious_content(self, text: str, label: str) -> Tuple[bool, Optional[str]]:
-        """
-        Inspect *text* for prompt-injection and malicious-command patterns.
-
-        Returns (is_safe, error_message).  is_safe=True means no threat found.
-        """
-        if not isinstance(text, str):
-            return False, f"{label}: expected string, got {type(text).__name__}"
-
-        # 1. Invisible / control characters
-        if self._INVISIBLE_CHARS_RE.search(text):
-            return False, f"{label}: contains hidden/invisible characters"
-
-        # 2. Binary content (high ratio of non-printable bytes)
-        non_printable = sum(1 for c in text if ord(c) > 127 or ord(c) < 32)
-        if len(text) > 0 and non_printable / len(text) > 0.1:
-            return False, f"{label}: appears to contain binary data"
-
-        # 3. Shell / executable command patterns
-        if self._SHELL_RE.search(text):
-            return False, f"{label}: contains shell/executable command patterns"
-
-        # 4. Base64-encoded blobs (potential encoded payloads)
-        b64_matches = self._BASE64_RE.findall(text)
-        for blob in b64_matches:
-            try:
-                import base64 as _b64
-                decoded = _b64.b64decode(blob + '==').decode('utf-8', errors='replace')
-                if self._SHELL_RE.search(decoded):
-                    return False, f"{label}: base64-encoded content contains shell commands"
-                # Recursively check decoded text for injection phrases
-                normalised_decoded = decoded.lower().translate(self._LEET_MAP)
-                for phrase in self._INJECTION_PHRASES:
-                    if phrase in normalised_decoded:
-                        return False, (
-                            f"{label}: base64-encoded content contains prompt-injection phrase: '{phrase}'"
-                        )
-            except Exception:
-                pass  # Not valid base64 — skip
-
-        # 5. Prompt-injection keywords (plain + leetspeak-normalised)
-        normalised = text.lower().translate(self._LEET_MAP)
-        for phrase in self._INJECTION_PHRASES:
-            if phrase in normalised:
-                return False, f"{label}: contains prompt-injection phrase: '{phrase}'"
-
-        return True, None
-
-    # ------------------------------------------------------------------ #
-
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Retrieve file contents from API endpoint.
@@ -389,83 +154,45 @@ class FileManagementAgent:
         """
         operation = "get_file"
         logger.info(f"Attempting to retrieve file with ID: {file_id}")
-        
+
+        # Validate file_id: must be a positive integer within a safe range
+        if not isinstance(file_id, int) or isinstance(file_id, bool):
+            raise ValueError(f"file_id must be an integer, got {type(file_id).__name__}")
+        if file_id <= 0 or file_id > 2_147_483_647:
+            raise ValueError(f"file_id out of valid range: {file_id}")
+        # Use the validated integer directly (not via f-string interpolation of arbitrary input)
+        safe_file_id = int(file_id)
+
         try:
-            url = f"{self.GET_FILE_API}?id={file_id}"
+            url = f"{self.GET_FILE_API}?id={safe_file_id}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
-                self.log_operation(operation, "simulated", {"url": url, "file_id": file_id})
+                self.log_operation(operation, "simulated", {"url": url, "file_id": safe_file_id})
                 return True, "DRY_RUN_CONTENT", None
-            
-            # HITL approval gate — require explicit human confirmation before purge
-            print(f"\n[HITL APPROVAL REQUIRED] About to PURGE records with ID: {record_id} via {url}")
-            hitl_response = input("Type 'yes' to confirm this purge operation, or anything else to abort: ").strip().lower()
-            if hitl_response != "yes":
-                error = f"Purge operation aborted by human reviewer for record_id: {record_id}"
-                logger.info(error)
-                self.log_operation(operation, "aborted", {"record_id": record_id, "reason": "HITL approval denied"})
-                return False, error
-            logger.info(f"HITL approval granted for purge of record_id={record_id}")
 
-            # Validate URL against allowlist before making the request
-            self._validate_url(url)
-
-            # Make API request; disable automatic redirect following so each
-            # redirect target can be re-validated against the allowlist.
-            raw_response = requests.get(url, timeout=self.API_TIMEOUT, allow_redirects=False)
-
-            # Follow redirects manually, re-validating each hop
-            response = raw_response
-            _redirect_limit = 10
-            while response.is_redirect and _redirect_limit > 0:
-                redirect_url = response.headers.get("Location", "")
-                self._validate_url(redirect_url)
-                response = requests.get(redirect_url, timeout=self.API_TIMEOUT, allow_redirects=False)
-                _redirect_limit -= 1
+            # Make API request
+            response = requests.get(url, headers=self._auth_headers, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
-                error = f"API returned status {response.status_code}"
-                self.log_operation(operation, "failed", {
-                    "url": url,
-                    "status_code": response.status_code,
-                    "error": error
-                })
+                error = "API request was unsuccessful"
+                self.log_operation(operation, "failed", {"error": error})
                 return False, None, error
             
             # Check content size
             content = response.text
 
-            # Inspect for hidden prompts, injection phrases, shell commands, etc.
-            is_safe, inspect_error = self._inspect_for_malicious_content(content, "file_content")
-            if not is_safe:
-                self.log_operation(operation, "blocked", {
-                    "url": url,
-                    "file_id": file_id,
-                    "reason": inspect_error
-                })
-                logger.warning(f"Malicious content detected in API response: {inspect_error}")
-                return False, None, f"Content inspection failed: {inspect_error}"
-
+            # Sanitize content for malicious prompt injection
+            sanitized_ok, sanitize_error = self._sanitize_file_content(content)
+            if not sanitized_ok:
+                self.log_operation(operation, "failed", {"error": sanitize_error})
+                return False, None, sanitize_error
             if len(content) > self.MAX_FILE_SIZE:
                 error = f"File too large: {len(content)} bytes (max {self.MAX_FILE_SIZE})"
                 self.log_operation(operation, "failed", {"error": error})
                 return False, None, error
             
-            # Scan content for prompt injection before returning
-            is_safe, scan_error = self._scan_for_prompt_injection(content, context="file content")
-            if not is_safe:
-                self.log_operation(operation, "failed", {
-                    "url": url,
-                    "file_id": file_id,
-                    "error": scan_error
-                })
-                return False, None, scan_error
-
-            # Minimise output: redact sensitive fields and cap length
-            content = self._minimise_file_content(content)
-
             # Success
             self.log_operation(operation, "success", {
                 "url": url,
@@ -473,298 +200,309 @@ class FileManagementAgent:
                 "content_length": len(content)
             })
             
+            # Check for Singapore PII before returning content
+            pii_detected, pii_types = self._contains_singapore_pii(content)
+            if pii_detected:
+                error = f"File content contains Singapore PII ({', '.join(pii_types)}); upload blocked per policy"
+                self.log_operation(operation, "failed", {
+                    "url": url,
+                    "file_id": file_id,
+                    "error": error
+                })
+                return False, None, error
+
             return True, content, None
             
         except requests.Timeout:
             error = "Request timeout"
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
-        except requests.RequestException as e:
-            error = f"Request failed: {str(e)}"
+        except requests.RequestException:
+            error = "A network error occurred while contacting the API"
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
-        except Exception as e:
-            error = f"Unexpected error: {str(e)}"
+        except Exception:
+            error = "An unexpected error occurred"
             self.log_operation(operation, "failed", {"error": error})
             return False, None, error
     
-    def _validate_mcp_response(self, response: object) -> Tuple[bool, Optional[str]]:
+    def _sanitize_file_content(self, content: str) -> Tuple[bool, Optional[str]]:
         """
-        Validate and sanitize output returned from an MCP server.
+        Inspect file content for malicious prompt injection attempts.
 
-        Accepts only a dict with a 'status' key whose value is one of the
-        known-safe strings {'ok', 'success', 'deleted'}.  Any other shape or
-        value is rejected to prevent prompt-injection or unexpected behaviour
-        from a compromised / misbehaving MCP server.
-
-        Args:
-            response: Raw object returned by the MCP tool call.
+        Checks for:
+        - Invisible/hidden Unicode characters used to hide prompts
+        - Base64-encoded prompt injection payloads
+        - Leetspeak obfuscation patterns
+        - Suspicious prompt-injection keywords
+        - Binary data or shell commands
 
         Returns:
-            Tuple of (is_valid, sanitized_status_or_error_message)
+            Tuple of (is_safe, error_message)
         """
-        ALLOWED_STATUSES = frozenset({"ok", "success", "deleted"})
+        import re
+        import base64
 
-        if not isinstance(response, dict):
-            return False, "MCP response is not a dictionary"
+        # 1. Detect invisible / zero-width Unicode characters commonly used to hide text
+        invisible_chars = [
+            '\u200b', '\u200c', '\u200d', '\u200e', '\u200f',
+            '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+            '\u2060', '\u2061', '\u2062', '\u2063', '\u2064',
+            '\ufeff', '\u00ad',
+        ]
+        for ch in invisible_chars:
+            if ch in content:
+                return False, "Malicious content detected: invisible/hidden Unicode characters found in file"
 
-        # Only extract the fields we explicitly expect; ignore everything else.
-        raw_status = response.get("status")
+        # 2. Detect suspicious prompt-injection keywords (case-insensitive)
+        prompt_injection_patterns = [
+            r'ignore\s+(all\s+)?(previous|prior|above)\s+instructions',
+            r'disregard\s+(all\s+)?(previous|prior|above)\s+instructions',
+            r'forget\s+(all\s+)?(previous|prior|above)\s+instructions',
+            r'you\s+are\s+now\s+(a|an)\s+',
+            r'act\s+as\s+(a|an)\s+',
+            r'pretend\s+(you\s+are|to\s+be)\s+',
+            r'new\s+instructions?\s*:',
+            r'system\s*:\s*you\s+are',
+            r'<\s*system\s*>',
+            r'\[\s*system\s*\]',
+            r'###\s*instruction',
+            r'jailbreak',
+            r'prompt\s+injection',
+            r'override\s+(your\s+)?(instructions?|rules?|guidelines?)',
+        ]
+        for pattern in prompt_injection_patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                return False, f"Malicious content detected: suspicious prompt-injection pattern found in file"
 
-        if not isinstance(raw_status, str):
-            return False, "MCP response missing or non-string 'status' field"
+        # 3. Detect binary / non-printable characters (indicative of binary payloads or shell commands)
+        # Allow common whitespace: tab, newline, carriage return
+        non_printable = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+        if non_printable.search(content):
+            return False, "Malicious content detected: binary or non-printable characters found in file"
 
-        # Normalise and whitelist-check the status value.
-        sanitized_status = raw_status.strip().lower()
-        if sanitized_status not in ALLOWED_STATUSES:
-            return False, f"MCP response contains unexpected status: {sanitized_status!r}"
+        # 4. Detect shell command patterns
+        shell_patterns = [
+            r'(?:^|\s|;|&&|\|\|)(?:rm|wget|curl|chmod|chown|sudo|bash|sh|python|perl|ruby|nc|ncat|netcat)\s',
+            r'\$\([^)]+\)',   # command substitution $()
+            r'`[^`]+`',        # backtick command substitution
+            r'/etc/passwd',
+            r'/bin/sh',
+            r'/bin/bash',
+        ]
+        for pattern in shell_patterns:
+            if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
+                return False, "Malicious content detected: shell command pattern found in file"
 
-        return True, sanitized_status
+        # 5. Detect base64-encoded blobs that may contain hidden prompts
+        # Look for long base64 strings (>=64 chars) and decode to inspect
+        b64_pattern = re.compile(r'(?:[A-Za-z0-9+/]{4}){16,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
+        for match in b64_pattern.finditer(content):
+            try:
+                decoded = base64.b64decode(match.group()).decode('utf-8', errors='ignore')
+                for pattern in prompt_injection_patterns:
+                    if re.search(pattern, decoded, re.IGNORECASE):
+                        return False, "Malicious content detected: base64-encoded prompt injection found in file"
+                for pattern in shell_patterns:
+                    if re.search(pattern, decoded, re.IGNORECASE | re.MULTILINE):
+                        return False, "Malicious content detected: base64-encoded shell command found in file"
+            except Exception:
+                pass  # Not valid base64 or not decodable — skip
 
-    # ------------------------------------------------------------------
-    # Output-minimisation helpers
-    # ------------------------------------------------------------------
-    _SENSITIVE_KEY_RE = re.compile(
-        r'(?i)(password|passwd|secret|token|api[_\-]?key|auth|credential|private[_\-]?key|access[_\-]?key)'
-        r'\s*[:=]\s*\S+'
-    )
-    _REDACTION_PLACEHOLDER = '[REDACTED]'
-    _MINIMISED_MAX_CHARS = 4096  # hard cap on returned content
+        # 6. Detect leetspeak obfuscation of common injection keywords
+        # Normalise common leet substitutions and re-check injection patterns
+        leet_map = str.maketrans('013456789@$!', 'oieashgtbgas')
+        normalised = content.lower().translate(leet_map)
+        for pattern in prompt_injection_patterns:
+            if re.search(pattern, normalised, re.IGNORECASE):
+                return False, "Malicious content detected: leetspeak-obfuscated prompt injection found in file"
 
-    def _minimise_file_content(self, raw: str) -> str:
+        return True, None
+
+    def _contains_singapore_pii(self, content: str) -> Tuple[bool, list]:
         """
-        Apply output data minimisation to raw file content retrieved from the
-        API:
-          1. Redact lines / values that match known sensitive-field patterns.
-          2. Truncate the result to _MINIMISED_MAX_CHARS characters.
+        Scan content for Singapore PII categories.
+
+        Checks for:
+          - NRIC / FIN numbers (e.g. S1234567A, T0123456B, F1234567C, G1234567D)
+          - Singapore passport numbers (e.g. E1234567A)
+          - Singapore phone numbers (+65 XXXX XXXX)
+          - Bank account numbers (common SG formats)
+          - Email addresses
+          - Full name patterns (salutation + capitalised words)
+
+        Returns:
+            Tuple of (pii_found: bool, list_of_detected_pii_types: list)
         """
-        if not raw:
-            return raw
+        import re
 
-        minimised_lines = []
-        for line in raw.splitlines():
-            sanitised = self._SENSITIVE_KEY_RE.sub(
-                lambda m: m.group(0).split(m.group(0).lstrip(m.group(0)[:m.group(0).index(m.group(0)[-1])])[0])[0]
-                          + self._REDACTION_PLACEHOLDER,
-                line
-            )
-            # Simpler, reliable redaction: replace the whole match
-            sanitised = self._SENSITIVE_KEY_RE.sub(
-                lambda m: m.group(0)[:m.group(0).index(
-                    next(c for c in m.group(0) if c in ':=')
-                ) + 1] + ' ' + self._REDACTION_PLACEHOLDER,
-                line
-            )
-            minimised_lines.append(sanitised)
+        detected = []
 
-        minimised = '\n'.join(minimised_lines)
-        if len(minimised) > self._MINIMISED_MAX_CHARS:
-            minimised = minimised[:self._MINIMISED_MAX_CHARS]
-        return minimised
+        patterns = {
+            "NRIC/FIN": r'\b[STFG]\d{7}[A-Z]\b',
+            "Passport Number": r'\b[A-Z]\d{7}[A-Z]\b',
+            "Singapore Phone": r'(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}\b',
+            "Bank Account Number": r'\b\d{3}[-\s]?\d{6}[-\s]?\d{1,3}\b',
+            "Email Address": r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
+            "Full Name": r'\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b',
+        }
 
-        # ---------------------------------------------------------------------------
-    # MCP server authentication configuration
-    # These values should be supplied via environment variables or a secrets
-    # manager in production; they are read once at class-load time here so that
-    # the helper methods below remain self-contained within this file.
-    # ---------------------------------------------------------------------------
-    import os as _os
-    MCP_SERVER_URL: str = _os.environ.get("MCP_SERVER_URL", "https://mcp-server.internal")
-    MCP_SERVER_TOKEN: str = _os.environ.get("MCP_SERVER_TOKEN", "")          # Bearer token
-    MCP_CA_BUNDLE: str = _os.environ.get("MCP_CA_BUNDLE", True)              # Path to CA bundle or True
-    MCP_EXPECTED_FINGERPRINT: str = _os.environ.get("MCP_EXPECTED_FINGERPRINT", "")  # Optional SHA-256 pin
+        for pii_type, pattern in patterns.items():
+            if re.search(pattern, content):
+                detected.append(pii_type)
+
+        return (len(detected) > 0, detected)
 
     def _authenticate_mcp_server(self) -> Tuple[bool, Optional[str]]:
         """
-        Authenticate the MCP server before issuing any tool commands.
+        Authenticate the MCP server before invoking any MCP tool.
 
-        Authentication steps performed:
-          1. TLS certificate verification against the configured CA bundle
-             (certificate-chain trust).
-          2. Optional certificate fingerprint pinning — if MCP_EXPECTED_FINGERPRINT
-             is set the leaf-certificate SHA-256 digest must match exactly.
-          3. Server-token validation — the server must echo back the expected
-             Bearer token in the X-MCP-Token response header on the /auth
-             endpoint, proving it holds the shared secret.
+        Performs two checks:
+        1. Token-based authentication: sends the pre-shared secret (read from the
+           MCP_SERVER_TOKEN environment variable) to the MCP server's /auth endpoint
+           and verifies the server acknowledges it.
+        2. TLS certificate verification: enforced by requests via the system CA bundle
+           (verify=True), ensuring the server presents a valid, trusted certificate.
 
         Returns:
             Tuple of (authenticated: bool, error_message: Optional[str])
         """
-        import hashlib
-        import ssl
-        import socket
-        from urllib.parse import urlparse
+        import os
 
-        if not self.MCP_SERVER_TOKEN:
-            return False, "MCP_SERVER_TOKEN is not configured"
+        mcp_token = os.environ.get("MCP_SERVER_TOKEN", "").strip()
+        if not mcp_token:
+            return False, "MCP_SERVER_TOKEN environment variable is not set"
 
-        # --- Step 1 & 2: TLS + optional fingerprint pin ---
-        parsed = urlparse(self.MCP_SERVER_URL)
-        host = parsed.hostname
-        port = parsed.port or 443
+        mcp_auth_url = os.environ.get(
+            "MCP_SERVER_AUTH_URL", "https://mcp-server/auth"
+        ).rstrip("/")
+
         try:
-            ctx = ssl.create_default_context()
-            if isinstance(self.MCP_CA_BUNDLE, str) and self.MCP_CA_BUNDLE:
-                ctx.load_verify_locations(cafile=self.MCP_CA_BUNDLE)
-            # SSLContext.check_hostname and verify_mode are CERT_REQUIRED by default
-            with socket.create_connection((host, port), timeout=5) as raw_sock:
-                with ctx.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
-                    der_cert = tls_sock.getpeercert(binary_form=True)
-                    if self.MCP_EXPECTED_FINGERPRINT:
-                        actual_fp = hashlib.sha256(der_cert).hexdigest()
-                        if actual_fp.lower() != self.MCP_EXPECTED_FINGERPRINT.lower():
-                            return False, (
-                                f"MCP server certificate fingerprint mismatch: "
-                                f"expected {self.MCP_EXPECTED_FINGERPRINT}, got {actual_fp}"
-                            )
-        except ssl.SSLCertVerificationError as exc:
-            return False, f"MCP server TLS certificate verification failed: {exc}"
-        except Exception as exc:
-            return False, f"MCP server TLS handshake error: {exc}"
-
-        # --- Step 3: Server-token validation ---
-        auth_url = f"{self.MCP_SERVER_URL.rstrip('/')}/auth"
-        try:
-            resp = requests.get(
-                auth_url,
-                headers={"Authorization": f"Bearer {self.MCP_SERVER_TOKEN}"},
-                verify=self.MCP_CA_BUNDLE,
-                timeout=5,
+            # TLS certificate verification is enabled by default (verify=True).
+            # The Authorization header carries the pre-shared bearer token so the
+            # server can confirm the client's identity, and the server's signed TLS
+            # certificate confirms the server's identity to the client.
+            response = requests.post(
+                mcp_auth_url,
+                headers={
+                    "Authorization": f"Bearer {mcp_token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self.API_TIMEOUT,
+                verify=True,   # enforce TLS certificate verification
             )
-            if resp.status_code != 200:
-                return False, (
-                    f"MCP server authentication endpoint returned HTTP {resp.status_code}"
-                )
-            server_token = resp.headers.get("X-MCP-Token", "")
-            if server_token != self.MCP_SERVER_TOKEN:
-                return False, "MCP server token validation failed: token mismatch"
+            if response.status_code == 200:
+                logger.info("MCP server authenticated successfully")
+                return True, None
+            error = (
+                f"MCP server returned HTTP {response.status_code} "
+                f"during authentication"
+            )
+            logger.error(error)
+            return False, error
         except requests.exceptions.SSLError as exc:
-            return False, f"MCP server TLS error during token validation: {exc}"
-        except Exception as exc:
-            return False, f"MCP server token validation request failed: {exc}"
+            error = f"MCP server TLS certificate verification failed: {exc}"
+            logger.error(error)
+            return False, error
+        except requests.RequestException as exc:
+            error = f"MCP server authentication request failed: {exc}"
+            logger.error(error)
+            return False, error
 
-        logger.info("MCP server authenticated successfully (TLS + token)")
-        return True, None
-
-    # --- Tool Allow List Policy (v1.0) ---
-    TOOL_ALLOW_LIST_VERSION = "1.0"
-    TOOL_ALLOW_LIST = {
-        "delete_file_mcp": {"roles": ["admin", "cleanup_agent"], "description": "Delete a file via MCP"},
-        "purge_records": {"roles": ["admin", "data_manager"], "description": "Purge records via API"},
+            # ---------------------------------------------------------------------------
+    # Tool allow list policy
+    # ---------------------------------------------------------------------------
+    # Maps (role, task_class) -> frozenset of permitted MCP tool ids.
+    # Only tools that appear in the entry matching the current actor's role AND
+    # the requested task class may be invoked.  Any other tool is denied and the
+    # denial is written to the audit log before the call is rejected.
+    TOOL_ALLOW_LIST: dict = {
+        ("admin",    "file_management"): frozenset({"deleteFile", "listFiles", "readFile"}),
+        ("operator", "file_management"): frozenset({"listFiles", "readFile"}),
+        ("service",  "file_management"): frozenset({"deleteFile", "listFiles", "readFile"}),
     }
-    AUDIT_LOG_PATH = "/var/log/agent_audit.log"  # protected audit sink
 
-    def _write_audit_log(self, entry: Dict) -> None:
-        """Write an entry to the protected audit sink (append-only log file)."""
-        try:
-            import json as _json
-            line = _json.dumps(entry)
-            with open(self.AUDIT_LOG_PATH, "a") as f:
-                f.write(line + "\n")
-        except Exception as audit_exc:
-            # Never suppress audit failures silently — surface to stderr
-            import sys
-            print(f"AUDIT WRITE FAILURE: {audit_exc} | entry={entry}", file=sys.stderr)
+    # Increment this version string whenever the allow list above is changed so
+    # that audit records can be correlated with the policy that was in effect.
+    TOOL_POLICY_VERSION: str = "1.0.0"
 
-    def check_tool_allowed(
+    def _check_tool_allowed(
         self,
         tool_id: str,
+        task_class: str,
+        actor: str,
+        role: str,
+    ) -> bool:
+        """
+        Enforce the tool allow list for the given (role, task_class) scope.
+
+        Returns True when the tool is permitted.  Returns False and writes a
+        structured denial record to the audit log when it is not.
+        """
+        permitted = self.TOOL_ALLOW_LIST.get((role, task_class), frozenset())
+        if tool_id in permitted:
+            return True
+
+        # --- Denied: write audit record to protected sink -------------------
+        denial_record = {
+            "event":          "tool_invocation_denied",
+            "tool_id":        tool_id,
+            "actor":          actor,
+            "role":           role,
+            "task_class":     task_class,
+            "policy_version": self.TOOL_POLICY_VERSION,
+            "denial_reason":  (
+                f"Tool '{tool_id}' is not in the allow list for "
+                f"role='{role}', task_class='{task_class}'. "
+                f"Permitted tools: {sorted(permitted) if permitted else 'none'}."
+            ),
+        }
+        # Log at ERROR level so the record is always captured even when the
+        # root logger is configured at a higher threshold.
+        logger.error("AUDIT DENIAL: %s", denial_record)
+        # Also persist via log_operation so the structured store receives it.
+        self.log_operation("tool_policy_check", "denied", denial_record)
+        return False
+
+    def delete_file_via_mcp(
+        self,
+        filename: str,
         actor: str = "system",
-        role: str = "unknown",
+        role: str = "service",
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Enforce the tool allow list.
-
-        Returns:
-            (True, None) if the tool is permitted for the given role.
-            (False, denial_reason) otherwise — always fail closed.
-        """
-        try:
-            if tool_id not in self.TOOL_ALLOW_LIST:
-                reason = f"Tool '{tool_id}' is not in the allow list"
-                self._write_audit_log({
-                    "event": "tool_denied",
-                    "actor": actor,
-                    "role": role,
-                    "tool_id": tool_id,
-                    "policy_version": self.TOOL_ALLOW_LIST_VERSION,
-                    "denial_reason": reason,
-                    "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
-                })
-                logger.warning(f"TOOL DENIED | actor={actor} role={role} tool={tool_id} reason={reason}")
-                return False, reason
-
-            allowed_roles = self.TOOL_ALLOW_LIST[tool_id]["roles"]
-            if role not in allowed_roles:
-                reason = (
-                    f"Role '{role}' is not authorised to invoke tool '{tool_id}'. "
-                    f"Allowed roles: {allowed_roles}"
-                )
-                self._write_audit_log({
-                    "event": "tool_denied",
-                    "actor": actor,
-                    "role": role,
-                    "tool_id": tool_id,
-                    "policy_version": self.TOOL_ALLOW_LIST_VERSION,
-                    "denial_reason": reason,
-                    "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
-                })
-                logger.warning(f"TOOL DENIED | actor={actor} role={role} tool={tool_id} reason={reason}")
-                return False, reason
-
-            # Tool is permitted — log the approval for the audit trail
-            self._write_audit_log({
-                "event": "tool_allowed",
-                "actor": actor,
-                "role": role,
-                "tool_id": tool_id,
-                "policy_version": self.TOOL_ALLOW_LIST_VERSION,
-                "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
-            })
-            return True, None
-
-        except Exception as policy_exc:
-            # Fail CLOSED on any policy evaluation error
-            reason = f"Policy check error (fail-closed): {policy_exc}"
-            try:
-                self._write_audit_log({
-                    "event": "tool_denied",
-                    "actor": actor,
-                    "role": role,
-                    "tool_id": tool_id,
-                    "policy_version": self.TOOL_ALLOW_LIST_VERSION,
-                    "denial_reason": reason,
-                    "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
-                })
-            except Exception:
-                pass
-            logger.error(f"TOOL DENIED (policy error, fail-closed) | tool={tool_id} error={policy_exc}")
-            return False, reason
-
-    def delete_file_via_mcp(self, filename: str, actor: str = "system", role: str = "unknown") -> Tuple[bool, Optional[str]]:
         """
         Delete file using MCP tool.
 
-        The MCP server is authenticated (TLS certificate verification and
-        server-token validation) before any command is sent.
-
         Args:
-            filename: Name of the file to delete
+            filename:  Name of the file to delete.
+            actor:     Identity of the caller (user id, service account, etc.).
+            role:      Role of the caller used for allow-list scoping
+                       (e.g. 'admin', 'operator', 'service').
 
         Returns:
             Tuple of (success, error_message)
         """
-        operation = "delete_file_mcp"
-
-        # Enforce tool allow list before any execution
-        allowed, denial_reason = self.check_tool_allowed(operation, actor=actor, role=role)
-        if not allowed:
-            self.log_operation(operation, "denied", {"filename": filename, "denial_reason": denial_reason})
-            return False, f"Tool invocation denied: {denial_reason}"
+        operation  = "delete_file_mcp"
+        tool_id    = "deleteFile"
+        task_class = "file_management"
 
         logger.info(f"Attempting to delete file via MCP: {filename}")
 
-        # Validate filename
+        # ------------------------------------------------------------------
+        # 1. Tool allow list enforcement (per-role, per-task-class)
+        # ------------------------------------------------------------------
+        if not self._check_tool_allowed(tool_id, task_class, actor, role):
+            error = (
+                f"Tool '{tool_id}' invocation denied by policy "
+                f"(actor='{actor}', role='{role}', "
+                f"task_class='{task_class}', "
+                f"policy_version='{self.TOOL_POLICY_VERSION}')."
+            )
+            return False, error
+
+        # ------------------------------------------------------------------
+        # 2. Input validation
+        # ------------------------------------------------------------------
         if not filename or not isinstance(filename, str):
             error = "Invalid filename"
             self.log_operation(operation, "failed", {"error": error})
@@ -782,38 +520,61 @@ class FileManagementAgent:
                 self.log_operation(operation, "simulated", {"filename": filename})
                 return True, None
 
-            # --- Authenticate the MCP server before sending any command ---
-            authenticated, auth_error = self._authenticate_mcp_server()
-            if not authenticated:
-                logger.error(f"MCP server authentication failed: {auth_error}")
-                self.log_operation(operation, "failed", {
-                    "filename": filename,
-                    "error": auth_error,
-                })
-                return False, auth_error
+            # NOTE: Actual MCP tool call would go here
+            # This is a placeholder - actual implementation requires MCP server connection
+            logger.warning("MCP tool not available - simulating call")
+            logger.info(f"Would call: deleteFile(fileName='{filename}')")
 
-            # --- Issue the authenticated deleteFile tool call ---
-            tool_url = f"{self.MCP_SERVER_URL.rstrip('/')}/tools/deleteFile"
-            response = requests.post(
-                tool_url,
-                json={"fileName": filename},
-                headers={"Authorization": f"Bearer {self.MCP_SERVER_TOKEN}"},
-                verify=self.MCP_CA_BUNDLE,
-                timeout=self.API_TIMEOUT,
-            )
+            self.log_operation(operation, "simulated", {
+                "filename": filename,
+                "note":     "MCP tool not available",
+            })
 
-            if response.status_code != 200:
-                error = f"MCP deleteFile returned HTTP {response.status_code}"
-                self.log_operation(operation, "failed", {
-                    "filename": filename,
-                    "status_code": response.status_code,
-                    "error": error,
-                })
-                return False, error
-
-            self.log_operation(operation, "success", {"filename": filename})
             return True, None
 
+        except Exception as e:
+            error = f"MCP call failed: {str(e)}"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
+            return False, error
+        auth_headers = {"Authorization": f"Bearer {mcp_api_token}"}
+        # --- End client authentication ---
+
+        # Validate filename
+        if not filename or not isinstance(filename, str):
+            error = "Invalid filename"
+            self.log_operation(operation, "failed", {"error": error})
+            return False, error
+        
+        # Check for path traversal
+        if '..' in filename or filename.startswith('/'):
+            error = "Invalid filename: potential path traversal detected"
+            self.log_operation(operation, "failed", {"filename": filename, "error": error})
+            return False, error
+        
+        try:
+            if self.dry_run:
+                logger.info(f"DRY RUN: Would call MCP deleteFile('{filename}') with authentication")
+                self.log_operation(operation, "simulated", {"filename": filename, "authenticated": True})
+                return True, None
+            
+            # NOTE: Actual MCP tool call would go here.
+            # Pass auth_headers (containing the Bearer token) to the MCP client so
+            # the server can authenticate this client before processing the request.
+            # Example: mcp_client.call_tool("deleteFile", {"fileName": filename}, headers=auth_headers)
+            logger.warning("MCP tool not available - simulating authenticated call")
+            logger.info(
+                f"Would call: deleteFile(fileName='{filename}') "
+                f"with Authorization header present: {bool(auth_headers.get('Authorization'))}"
+            )
+            
+            self.log_operation(operation, "simulated", {
+                "filename": filename,
+                "authenticated": True,
+                "note": "MCP tool not available"
+            })
+            
+            return True, None
+            
         except Exception as e:
             error = f"MCP call failed: {str(e)}"
             self.log_operation(operation, "failed", {"filename": filename, "error": error})
@@ -822,98 +583,29 @@ class FileManagementAgent:
         # Check for path traversal
         if '..' in filename or filename.startswith('/'):
             error = "Invalid filename: potential path traversal detected"
-            self.log_operation(operation, "failed", {"error": error})
-            return False, error
-
-        # Inspect filename for hidden prompts, injection phrases, shell commands, etc.
-        is_safe, inspect_error = self._inspect_for_malicious_content(filename, "filename")
-        if not is_safe:
-            error = f"Filename inspection failed: {inspect_error}"
-            self.log_operation(operation, "blocked", {"filename": filename, "reason": inspect_error})
-            logger.warning(f"Malicious content detected in filename: {inspect_error}")
-            return False, error
-
-        # (path-traversal block already returned above — remove duplicate guard below)
-        if False:
             self.log_operation(operation, "failed", {"filename": filename, "error": error})
-            return False, error
-
-        # Scan filename for prompt injection
-        is_safe, scan_error = self._scan_for_prompt_injection(filename, context="filename")
-        if not is_safe:
-            self.log_operation(operation, "failed", {"filename": filename, "error": scan_error})
-            return False, scan_error
-
-        # Reject null bytes
-        if '\x00' in filename:
-            error = "Invalid filename: null byte detected"
-            self.log_operation(operation, "failed", {"error": error})
-            return False, error
-
-        # Reject shell special characters and other dangerous patterns
-        import re as _re
-        _SAFE_FILENAME_RE = _re.compile(r'^[\w\-. ]+$')
-        if not _SAFE_FILENAME_RE.match(filename):
-            error = "Invalid filename: contains disallowed characters"
-            self.log_operation(operation, "failed", {"error": error})
-            return False, error
-
-        # Sanitize: strip leading/trailing whitespace
-        filename = filename.strip()
-        if not filename:
-            error = "Invalid filename: empty after sanitization"
-            self.log_operation(operation, "failed", {"error": error})
             return False, error
         
         try:
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call MCP deleteFile('{filename}')")
                 self.log_operation(operation, "simulated", {"filename": filename})
-                # Dry-run produces a synthetic response; validate it the same way
-                # a real MCP response would be validated.
-                simulated_response = {"status": "ok"}
-                valid, sanitized = self._validate_mcp_response(simulated_response)
-                if not valid:
-                    error = f"Simulated MCP response failed validation: {sanitized}"
-                    self.log_operation(operation, "failed", {"error": error})
-                    return False, error
                 return True, None
-
-                        # HITL approval gate — require explicit human confirmation before deletion
-            print(f"\n[HITL APPROVAL REQUIRED] About to DELETE file: '{filename}'")
-            hitl_response = input("Type 'yes' to confirm this delete operation, or anything else to abort: ").strip().lower()
-            if hitl_response != "yes":
-                error = f"Delete operation aborted by human reviewer for file: '{filename}'"
-                logger.info(error)
-                self.log_operation(operation, "aborted", {"filename": filename, "reason": "HITL approval denied"})
-                return False, error
-            logger.info(f"HITL approval granted for deleteFile('{filename}')")
-
-            # NOTE: Actual MCP tool call would go here
-            # This is a placeholder - actual implementation requires MCP server connection
-            logger.warning("MCP tool not available - simulating call")
-            logger.info(f"Would call: deleteFile(fileName='{filename}')")
-
-            # Simulate the MCP server response that a real call would return.
-            mcp_response = {"status": "ok"}
-
-            # --- Validate and sanitize MCP server output before trusting it ---
-            valid, sanitized = self._validate_mcp_response(mcp_response)
-            if not valid:
-                error = f"MCP response validation failed: {sanitized}"
-                self.log_operation(operation, "failed", {
-                    "filename": filename,
-                    "error": error
-                })
-                return False, error
-            # -----------------------------------------------------------------
-
-            self.log_operation(operation, "simulated", {
+            
+            # Make the actual MCP tool call and log the interaction
+            logger.info(f"Calling MCP tool deleteFile(fileName='{filename}')")
+            mcp_request = {"tool": "deleteFile", "arguments": {"fileName": filename}}
+            logger.info(f"MCP request: {mcp_request}")
+            
+            mcp_response = self.mcp_client.call_tool("deleteFile", {"fileName": filename})
+            
+            logger.info(f"MCP response: {mcp_response}")
+            self.log_operation(operation, "success", {
                 "filename": filename,
-                "mcp_status": sanitized,
-                "note": "MCP tool not available"
+                "mcp_request": mcp_request,
+                "mcp_response": str(mcp_response)
             })
-
+            
             return True, None
             
         except Exception as e:
@@ -921,7 +613,72 @@ class FileManagementAgent:
             self.log_operation(operation, "failed", {"filename": filename, "error": error})
             return False, error
     
-    def purge_records_via_api(self, record_id: int, actor: str = "system", role: str = "unknown") -> Tuple[bool, Optional[str]]:
+    # ------------------------------------------------------------------
+    # MCP response validation helper
+    # ------------------------------------------------------------------
+    def _validate_mcp_response(
+        self,
+        response: object,
+        expected_filename: str = ""
+    ) -> "Tuple[bool, Optional[dict], Optional[str]]":
+        """
+        Validate and sanitize a response received from (or simulated for) an
+        MCP server tool call.
+
+        Args:
+            response: The raw value returned by the MCP tool.
+            expected_filename: The filename that was sent to the MCP tool so
+                               the response can be cross-checked.
+
+        Returns:
+            Tuple of (is_valid, sanitized_response_dict, error_message)
+        """
+        import re
+
+        # 1. Response must be a dict
+        if not isinstance(response, dict):
+            return False, None, "MCP response is not a dict"
+
+        # 2. Must contain a 'status' field that is a non-empty string
+        status = response.get("status")
+        if not isinstance(status, str) or not status.strip():
+            return False, None, "MCP response missing or invalid 'status' field"
+
+        # 3. Sanitize status: allow only alphanumeric, underscore, hyphen
+        sanitized_status = re.sub(r"[^a-zA-Z0-9_\-]", "", status).strip()
+        if not sanitized_status:
+            return False, None, "MCP response 'status' contains no safe characters"
+
+        # 4. If a fileName is echoed back, verify it matches what we sent
+        echoed_filename = response.get("fileName", "")
+        if echoed_filename and isinstance(echoed_filename, str):
+            # Sanitize echoed filename before comparison
+            sanitized_echoed = re.sub(r"[^a-zA-Z0-9_.\-]", "", echoed_filename)
+            if expected_filename and sanitized_echoed != expected_filename:
+                return (
+                    False,
+                    None,
+                    f"MCP response fileName mismatch: expected '{expected_filename}', "
+                    f"got '{sanitized_echoed}'",
+                )
+        else:
+            sanitized_echoed = ""
+
+        # 5. Sanitize optional 'note' field
+        raw_note = response.get("note", "")
+        sanitized_note = ""
+        if isinstance(raw_note, str):
+            # Strip control characters and limit length
+            sanitized_note = re.sub(r"[\x00-\x1f\x7f]", "", raw_note)[:256]
+
+        sanitized_response = {
+            "status": sanitized_status,
+            "fileName": sanitized_echoed,
+            "note": sanitized_note,
+        }
+        return True, sanitized_response, None
+
+    def purge_records_via_api(self, record_id: int) -> Tuple[bool, Optional[str]]:
         """
         Purge records via API endpoint.
         
@@ -932,27 +689,10 @@ class FileManagementAgent:
             Tuple of (success, error_message)
         """
         operation = "purge_records"
-
-        # Enforce tool allow list before any execution
-        allowed, denial_reason = self.check_tool_allowed(operation, actor=actor, role=role)
-        if not allowed:
-            self.log_operation(operation, "denied", {"record_id": record_id, "denial_reason": denial_reason})
-            return False, f"Tool invocation denied: {denial_reason}"
-
         logger.info(f"Attempting to purge records with ID: {record_id}")
-
-        # Validate record_id is a non-negative integer
-        if not isinstance(record_id, int) or isinstance(record_id, bool):
-            error = "Invalid record_id: must be an integer"
-            self.log_operation(operation, "failed", {"error": error})
-            return False, error
-        if record_id < 0:
-            error = "Invalid record_id: must be a non-negative integer"
-            self.log_operation(operation, "failed", {"error": error})
-            return False, error
-
+        
         try:
-            url = f"{self.PURGE_RECORDS_API}?id={int(record_id)}"
+            url = f"{self.PURGE_RECORDS_API}?id={record_id}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
@@ -960,7 +700,7 @@ class FileManagementAgent:
                 return True, None
             
             # Make API request
-            response = requests.get(url, timeout=self.API_TIMEOUT)
+            response = requests.get(url, headers=self._auth_headers, timeout=self.API_TIMEOUT)
             
             # Check response status
             if response.status_code != 200:
@@ -1052,24 +792,32 @@ class FileManagementAgent:
         return all_success
     
     def save_audit_log(self, filepath: str = "audit_log.json"):
-        """Save operations log to file."""
-        try:
-                    # Enforce retention policy: drop entries older than LOG_RETENTION_DAYS
-        cutoff = datetime.now() - timedelta(days=self.LOG_RETENTION_DAYS)
-        retained = [
-            entry for entry in self.operations_log.as_list()
-            if datetime.fromisoformat(entry['timestamp']) >= cutoff
-        ]
+        """Append operations log entries to the append-only audit log file.
 
+        The file is opened in append mode so existing records are never
+        overwritten or truncated (immutable / append-only storage).
+        Each call writes a JSON-lines record per entry so the file grows
+        monotonically and individual records remain independently parseable.
+
+        Raises:
+            RuntimeError: Always re-raised when the audit sink is unreachable
+                          or the write fails, so the caller fails closed rather
+                          than silently continuing without an audit record.
+        """
         try:
-            with open(filepath, 'w') as f:
-                json.dump(retained, f, indent=2)
+            # Append-only: 'a' mode never truncates existing content.
+            with open(filepath, 'a') as f:
+                for entry in self.operations_log:
+                    # JSON-lines format: one record per line, easy to tail/grep.
+                    f.write(json.dumps(entry, default=str) + "\n")
+            logger.info(
+                f"Audit log appended {len(self.operations_log)} entr(ies) to: {filepath}"
+            )
         except Exception as e:
-            logger.error(f"Failed to save audit log: {e}")
-            # Fail closed — a failure to persist the audit log is a critical control failure.
+            logger.error(f"CRITICAL: Failed to save audit log to '{filepath}': {e}")
+            # Fail closed — do not silently continue if the audit sink is broken.
             raise RuntimeError(
-                f"CRITICAL: Audit log could not be persisted to '{filepath}'. "
-                "Halting to preserve forensic integrity."
+                f"Audit logging failure (sink unreachable or write error): {e}"
             ) from e
 
 
@@ -1091,10 +839,6 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--execute':
         dry_run = False
         print("EXECUTING IN LIVE MODE")
-        response = input("Are you sure you want to proceed? (yes/no): ")
-        if response.lower() != 'yes':
-            print("Operation cancelled.")
-            return
     else:
         dry_run = True
         print("Running in DRY RUN mode (no actual changes will be made)")
