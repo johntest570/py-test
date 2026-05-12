@@ -27,7 +27,260 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import ipaddress
+import os
+import re
+
 logger = logging.getLogger("pr_scan.scm_client")
+
+# ---------------------------------------------------------------------------
+# URL allowlist enforcement
+# ---------------------------------------------------------------------------
+
+# Permitted SCM hostnames.  Override at deploy time via the environment variable
+# SCM_ALLOWED_HOSTS (comma-separated list of exact hostnames or *.suffix globs).
+_DEFAULT_ALLOWED_HOSTS: List[str] = [
+    "api.github.com",
+    "*.githubenterprise.com",
+    "api.bitbucket.org",
+    "*.bitbucket.org",
+    "gitlab.com",
+    "*.gitlab.com",
+]
+
+_ALLOWED_SCHEMES = {"https"}
+
+
+def _get_allowed_hosts() -> List[str]:
+    """Return the effective hostname allowlist, honouring SCM_ALLOWED_HOSTS."""
+    env_val = os.environ.get("SCM_ALLOWED_HOSTS", "").strip()
+    if env_val:
+        return [h.strip() for h in env_val.split(",") if h.strip()]
+    return list(_DEFAULT_ALLOWED_HOSTS)
+
+
+def _hostname_matches(hostname: str, pattern: str) -> bool:
+    """Return True if *hostname* matches *pattern* (exact or *.suffix glob)."""
+    hostname = hostname.lower()
+    pattern = pattern.lower()
+    if pattern.startswith("*."):
+        suffix = pattern[1:]  # e.g. ".githubenterprise.com"
+        return hostname.endswith(suffix) or hostname == suffix.lstrip(".")
+    return hostname == pattern
+
+
+def _is_private_ip(hostname: str) -> bool:
+    """Return True if *hostname* resolves to a private / link-local / loopback address."""
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    except ValueError:
+        # Not a bare IP literal — hostname will be resolved at connect time;
+        # we rely on the allowlist to block unexpected hostnames.
+        return False
+
+
+def validate_base_url(base_url: str) -> None:
+    """Raise ValueError if *base_url* is not on the scheme/host allowlist.
+
+    Checks performed:
+    1. Scheme must be ``https``.
+    2. Hostname must match at least one entry in the allowlist.
+    3. Hostname must not be a private/loopback/link-local IP address.
+    """
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+    except Exception as exc:  # pragma: no cover
+        raise ValueError(f"Malformed base_url {base_url!r}: {exc}") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"base_url scheme {scheme!r} is not allowed. "
+            f"Permitted schemes: {sorted(_ALLOWED_SCHEMES)}"
+        )
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError(f"base_url {base_url!r} contains no hostname.")
+
+    if _is_private_ip(hostname):
+        raise ValueError(
+            f"base_url hostname {hostname!r} resolves to a private/loopback/"
+            "link-local address and is not permitted."
+        )
+
+    allowed_hosts = _get_allowed_hosts()
+    if not any(_hostname_matches(hostname, pattern) for pattern in allowed_hosts):
+        raise ValueError(
+            f"base_url hostname {hostname!r} is not in the SCM host allowlist. "
+            f"Permitted patterns: {allowed_hosts}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-Loop (HITL) approval gate
+# ---------------------------------------------------------------------------
+
+def _hitl_approval(operation: str, details: str = "") -> None:
+    """Require explicit human approval before executing a risky operation.
+
+    This gate implements the Human-in-the-Loop (HITL) policy for operations
+    that are destructive or irreversible (remove, delete, purge, destroy, etc.).
+
+    Args:
+        operation: A short description of the operation about to be performed.
+        details:   Additional context (repo, PR number, labels, etc.).
+
+    Raises:
+        PermissionError: If the operator does not confirm the operation.
+    """
+    print("\n" + "=" * 70)
+    print("[HITL] HUMAN APPROVAL REQUIRED")
+    print(f"  Operation : {operation}")
+    if details:
+        print(f"  Details   : {details}")
+    print("=" * 70)
+    try:
+        answer = input("Type 'yes' to approve or anything else to abort: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer != "yes":
+        logger.warning("[HITL] Operation '%s' was REJECTED by the operator.", operation)
+        raise PermissionError(
+            f"[HITL] Risky operation '{operation}' was not approved by a human operator. "
+            "Aborting to prevent unintended destructive action."
+        )
+    logger.info("[HITL] Operation '%s' approved by operator.", operation)
+
+# ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+import re
+
+_REPO_RE = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+_SHA_RE  = re.compile(r'^[0-9a-fA-F]{7,64}$')
+_REF_RE  = re.compile(r'^[A-Za-z0-9_.\-/]+$')   # branch names, tags, short SHAs
+_BRANCH_RE = re.compile(r'^[A-Za-z0-9_.\-/]+$')
+_STATE_WHITELIST = frozenset({"pending", "success", "failure", "error"})
+_MAX_STR_LEN = 1024
+
+
+def _validate_repo(repo: str) -> str:
+    """Validate and return *repo* in 'owner/name' format."""
+    if not isinstance(repo, str):
+        raise ValueError("repo must be a string")
+    repo = repo.strip()
+    if len(repo) > _MAX_STR_LEN:
+        raise ValueError("repo value exceeds maximum length")
+    if not _REPO_RE.match(repo):
+        raise ValueError(
+            f"Invalid repo format {repo!r}. Expected 'owner/name' "
+            "containing only alphanumerics, hyphens, underscores, or dots."
+        )
+    return repo
+
+
+def _validate_pr_number(pr_number: int) -> int:
+    """Validate that *pr_number* is a positive integer."""
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool):
+        raise ValueError("pr_number must be an integer")
+    if pr_number <= 0:
+        raise ValueError("pr_number must be a positive integer")
+    return pr_number
+
+
+def _validate_path(path: str) -> str:
+    """Validate and sanitize a file path, rejecting traversal sequences."""
+    if not isinstance(path, str):
+        raise ValueError("path must be a string")
+    if len(path) > _MAX_STR_LEN:
+        raise ValueError("path value exceeds maximum length")
+    # Reject null bytes
+    if '\x00' in path:
+        raise ValueError("path must not contain null bytes")
+    # Normalize and reject traversal
+    normalized = path.replace('\\', '/')
+    parts = normalized.split('/')
+    resolved: list = []
+    for part in parts:
+        if part == '..':
+            raise ValueError("path must not contain traversal sequences ('..')")
+        if part not in ('', '.'):
+            resolved.append(part)
+    if not resolved:
+        raise ValueError("path must not be empty after normalization")
+    return '/'.join(resolved)
+
+
+def _validate_ref(ref: str) -> str:
+    """Validate a git ref (branch, tag, or commit SHA)."""
+    if not isinstance(ref, str):
+        raise ValueError("ref must be a string")
+    ref = ref.strip()
+    if len(ref) > _MAX_STR_LEN:
+        raise ValueError("ref value exceeds maximum length")
+    if not ref:
+        raise ValueError("ref must not be empty")
+    if not _REF_RE.match(ref):
+        raise ValueError(
+            f"Invalid ref {ref!r}. Only alphanumerics, hyphens, underscores, "
+            "dots, and forward slashes are allowed."
+        )
+    return ref
+
+
+def _validate_sha(sha: str) -> str:
+    """Validate a git commit/blob SHA (7-64 hex characters)."""
+    if not isinstance(sha, str):
+        raise ValueError("sha must be a string")
+    sha = sha.strip()
+    if not _SHA_RE.match(sha):
+        raise ValueError(
+            f"Invalid SHA {sha!r}. Expected 7-64 hexadecimal characters."
+        )
+    return sha
+
+
+def _validate_branch_name(branch_name: str) -> str:
+    """Validate a git branch name."""
+    if not isinstance(branch_name, str):
+        raise ValueError("branch_name must be a string")
+    branch_name = branch_name.strip()
+    if len(branch_name) > _MAX_STR_LEN:
+        raise ValueError("branch_name value exceeds maximum length")
+    if not branch_name:
+        raise ValueError("branch_name must not be empty")
+    if not _BRANCH_RE.match(branch_name):
+        raise ValueError(
+            f"Invalid branch_name {branch_name!r}. Only alphanumerics, "
+            "hyphens, underscores, dots, and forward slashes are allowed."
+        )
+    return branch_name
+
+
+def _validate_state(state: str) -> str:
+    """Validate a commit status state against the allowed whitelist."""
+    if not isinstance(state, str):
+        raise ValueError("state must be a string")
+    state = state.strip().lower()
+    if state not in _STATE_WHITELIST:
+        raise ValueError(
+            f"Invalid state {state!r}. Must be one of: "
+            + ', '.join(sorted(_STATE_WHITELIST))
+        )
+    return state
+
+
+def _sanitize_provider(provider: str) -> str:
+    """Strip and truncate provider string before use in error messages."""
+    if not isinstance(provider, str):
+        raise ValueError("provider must be a string")
+    # Truncate to a safe length and keep only printable ASCII to avoid
+    # log injection or information leakage.
+    sanitized = re.sub(r'[^\x20-\x7E]', '', provider.strip())[:64]
+    return sanitized
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -66,6 +319,7 @@ class SCMClient(ABC):
     """
 
     def __init__(self, token: str, base_url: str) -> None:
+        validate_base_url(base_url)
         self.token = token
         self.base_url = base_url.rstrip("/")
 
@@ -74,6 +328,7 @@ class SCMClient(ABC):
     @abstractmethod
     def get_pr_changed_files(self, repo: str, pr_number: int) -> List[ChangedFile]:
         """Return the list of files changed in the given PR."""
+        # Validation is enforced in concrete implementations.
 
     @abstractmethod
     def get_pr_head_sha(self, repo: str, pr_number: int) -> Tuple[str, str]:
@@ -82,10 +337,18 @@ class SCMClient(ABC):
         Fetches live from the SCM API so callers don't have to pass --head-sha
         and --branch manually.
         """
+        # Validation is enforced in concrete implementations.
 
     @abstractmethod
     def get_file_content(self, repo: str, path: str, ref: str) -> bytes:
         """Return the raw bytes of *path* at commit *ref*."""
+        # Validation is enforced in concrete implementations.
+
+    # -- HITL-gated risky operations ---------------------------------
+
+    def _require_hitl(self, operation: str, details: str = "") -> None:
+        """Convenience wrapper so subclasses can call ``self._require_hitl(...)``."""
+        _hitl_approval(operation=operation, details=details)
 
     # -- Comments -----------------------------------------------------------
 
@@ -118,6 +381,7 @@ class SCMClient(ABC):
     @abstractmethod
     def create_branch(self, repo: str, branch_name: str, from_sha: str) -> None:
         """Create a new branch pointing at *from_sha*."""
+        # Validation is enforced in concrete implementations.
 
     @abstractmethod
     def branch_exists(self, repo: str, branch_name: str) -> bool:
@@ -1276,6 +1540,15 @@ _PROVIDER_DEFAULTS: Dict[str, Tuple[type, str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# NOTE TO MAINTAINERS
+# ---------------------------------------------------------------------------
+# Any method whose name contains 'remove', 'delete', 'purge', or 'destroy'
+# MUST call ``self._require_hitl(operation, details)`` as its very first
+# statement.  The HITL gate is enforced by policy and must not be bypassed.
+# ---------------------------------------------------------------------------
+
+
 def create_scm_client(
     provider: str,
     token: str,
@@ -1300,4 +1573,6 @@ def create_scm_client(
         supported = ", ".join(sorted(_PROVIDER_DEFAULTS))
         raise ValueError(f"Unsupported SCM provider: {provider!r}. Supported: {supported}")
     cls, default_url = _PROVIDER_DEFAULTS[key]
-    return cls(token=token, base_url=base_url or default_url)
+    resolved_url = base_url or default_url
+    validate_base_url(resolved_url)
+    return cls(token=token, base_url=resolved_url)
