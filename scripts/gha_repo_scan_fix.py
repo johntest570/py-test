@@ -554,6 +554,57 @@ def build_json_output(
         "scan_errors": scan_errors or [],
     }
 
+
+def print_human_output(output: Dict[str, Any]) -> None:
+    status = output.get("status", "unknown")
+    violations = output.get("violations", [])
+    scan_errors = output.get("scan_errors", [])
+
+    if status == "compliant":
+        status_label = "compliant"
+    elif status == "violations_found":
+        status_label = "not compliant"
+    else:
+        status_label = status
+
+    print(f"Status: {status_label}")
+
+    if scan_errors:
+        for err in scan_errors:
+            print(f"  Error: {err}")
+        print()
+
+    if not violations:
+        if status == "compliant":
+            print("No violations found.")
+        return
+
+    from collections import defaultdict
+    by_file: Dict[str, List[str]] = defaultdict(list)
+    for v in violations:
+        file_ = v.get("file", "(unknown)")
+        control = v.get("control", "(unknown)")
+        by_file[file_].append(control)
+
+    num_files = len(by_file)
+    print(f"{len(violations)} violation(s) across {num_files} file(s)\n")
+
+    col_file = 40
+    col_controls = 60
+    print(f"{'File':<{col_file}}  Controls")
+    print("-" * (col_file + 2 + col_controls))
+
+    for file_, controls in sorted(by_file.items()):
+        first = True
+        for ctrl in controls:
+            if first:
+                print(f"{file_:<{col_file}}  {ctrl}")
+                first = False
+            else:
+                print(f"{'':<{col_file}}  {ctrl}")
+        print()
+
+
 # ===========================================================================
 # Patch application (ported from veracode_repo_scan.py, no external deps)
 # ===========================================================================
@@ -837,7 +888,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
         )
-        print(json.dumps(output, indent=2))
+        print_human_output(output)
         return 2
 
     try:
@@ -851,7 +902,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Auth failed: {exc}"],
         )
-        print(json.dumps(output, indent=2))
+        print_human_output(output)
         return 2
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -868,7 +919,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[],
         )
-        print(json.dumps(output, indent=2))
+        print_human_output(output)
         return 0
 
     manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
@@ -912,7 +963,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             violations=[], aibom=all_aibom, report=combined_report,
             scan_errors=failure_details,
         )
-        print(json.dumps(output, indent=2))
+        print_human_output(output)
         return 1
 
     status = "compliant" if not all_violations else "violations_found"
@@ -929,7 +980,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
         or os.environ.get("GH_TOKEN", "")
         or os.environ.get("GITHUB_TOKEN", "")
     )
-    if all_violations and github_token:
+    if all_violations and github_token and getattr(args, "create_fix_pr", True):
         logger.info(
             "STEP 3: Applying fix_code patches for %d violation(s)", len(all_violations)
         )
@@ -964,7 +1015,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
         failed_remediation_files=failed_rem_files,
         scan_errors=failure_details,
     )
-    print(json.dumps(output, indent=2))
+    print_human_output(output)
     return 0
 
 # ===========================================================================
@@ -1003,6 +1054,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "If not set, violations are reported but no PR is created.",
     )
     parser.add_argument(
+        "--create-fix-pr", default=True, action=argparse.BooleanOptionalAction,
+        help="Create a remediation PR with fix_code patches (default: true). "
+             "Use --no-create-fix-pr to skip PR creation.",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Enable DEBUG logging to stderr",
     )
@@ -1026,7 +1082,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:
         logger.exception("Unhandled error")
         err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
-        print(json.dumps(err, indent=2))
+        print_human_output(err)
         return 1
 
 
