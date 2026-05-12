@@ -924,7 +924,11 @@ def _execute_scan(args: argparse.Namespace) -> int:
     remediation_branch = ""
     failed_rem_files: List[str] = []
 
-    github_token = getattr(args, "github_token", None) or os.environ.get("GITHUB_TOKEN", "")
+    github_token = (
+        getattr(args, "github_token", None)
+        or os.environ.get("GH_TOKEN", "")
+        or os.environ.get("GITHUB_TOKEN", "")
+    )
     if all_violations and github_token:
         logger.info(
             "STEP 3: Applying fix_code patches for %d violation(s)", len(all_violations)
@@ -995,7 +999,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--github-token", default="",
-        help="GitHub token for creating remediation PRs (default: $GITHUB_TOKEN). "
+        help="GitHub token for creating remediation PRs (default: $GH_TOKEN then $GITHUB_TOKEN). "
              "If not set, violations are reported but no PR is created.",
     )
     parser.add_argument(
