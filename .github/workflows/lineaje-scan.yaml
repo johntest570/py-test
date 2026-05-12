@@ -24,7 +24,7 @@ jobs:
       - name: Run Lineaje AI policy scan
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-        run: python scripts/gha_repo_scan.py --source-path . | tee scan_result.json
+        run: python scripts/gha_repo_scan_fix.py --source-path . | tee scan_result.json
 
       - name: Log scan result
         run: cat scan_result.json
