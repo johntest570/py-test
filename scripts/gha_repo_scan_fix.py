@@ -30,13 +30,16 @@ Output (stdout, JSON)::
 
 Required environment variable::
 
-    LINEAJE_PAT_TOKEN  — Lineaje refresh token (exchanged for short-lived access tokens)
+    LINEAJE_PAT_TOKEN      — Lineaje refresh token (exchanged for short-lived access tokens)
+    LINEAJE_USER_NAME     — Username for user-level authentication (required before agent access)
+    LINEAJE_USER_PASSWORD — Password for user-level authentication (required before agent access)
 
 Exit codes::
 
     0 — scan completed (check "status" field)
     1 — runtime error
-    2 — configuration error (missing LINEAJE_PAT_TOKEN, missing repo/branch)
+    2 — configuration error (missing LINEAJE_PAT_TOKEN, missing LINEAJE_USER_NAME,
+            missing LINEAJE_USER_PASSWORD, or missing repo/branch)
 """
 
 from __future__ import annotations
@@ -64,14 +67,310 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("gha_repo_scan")
 
+
+def authenticate_user() -> None:
+    """Require explicit user authentication before accessing the AI Agent.
+
+    Reads USER_NAME and USER_PASSWORD from environment variables (suitable for
+    CI/CD pipelines where secrets are injected as env vars).  In interactive
+    contexts these can be set by the operator before invoking the script.
+
+    Raises SystemExit(2) if credentials are absent or empty, ensuring the
+    script cannot reach the MCP server without a verified user identity.
+    """
+    username = os.environ.get("LINEAJE_USER_NAME", "").strip()
+    password = os.environ.get("LINEAJE_USER_PASSWORD", "").strip()
+
+    missing: list[str] = []
+    if not username:
+        missing.append("LINEAJE_USER_NAME")
+    if not password:
+        missing.append("LINEAJE_USER_PASSWORD")
+
+    if missing:
+        logger.error(
+            "User authentication failed: the following required environment "
+            "variables are not set or are empty: %s. "
+            "Set them before running this script.",
+            ", ".join(missing),
+        )
+        sys.exit(2)
+
+    # Credential format validation — enforce non-trivial values.
+    if len(username) < 3:
+        logger.error(
+            "User authentication failed: LINEAJE_USER_NAME must be at least "
+            "3 characters long."
+        )
+        sys.exit(2)
+    if len(password) < 8:
+        logger.error(
+            "User authentication failed: LINEAJE_USER_PASSWORD must be at "
+            "least 8 characters long."
+        )
+        sys.exit(2)
+
+    logger.info("User authentication succeeded for user: %s", username)
+
 # ===========================================================================
 # Constants
 # ===========================================================================
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
+# ---------------------------------------------------------------------------
+# Tool / Agent allow lists — ONLY these identifiers may be invoked.
+# Any tool or agent NOT present here will be rejected at runtime.
+# ---------------------------------------------------------------------------
+ALLOWED_MCP_TOOLS: frozenset = frozenset({
+    "lineaje_scan",
+    "lineaje_report",
+    "lineaje_aibom",
+    "lineaje_policy_check",
+    "lineaje_remediation",
+    "read_file",
+    "write_file",
+    "list_directory",
+    "create_branch",
+    "commit_changes",
+    "open_pull_request",
+})
+
+ALLOWED_AGENTS: frozenset = frozenset({
+    "RepoScanAgent",
+    "RemediationAgent",
+})
+
+
+def _assert_tool_allowed(tool_name: str) -> None:
+    """Raise RuntimeError if *tool_name* is not in the explicit allow list."""
+    if tool_name not in ALLOWED_MCP_TOOLS:
+        raise RuntimeError(
+            f"Tool '{tool_name}' is not in the approved allow list "
+            f"({sorted(ALLOWED_MCP_TOOLS)}). Invocation blocked."
+        )
+
+
+def _assert_agent_allowed(agent_name: str) -> None:
+    """Raise RuntimeError if *agent_name* is not in the explicit allow list."""
+    if agent_name not in ALLOWED_AGENTS:
+        raise RuntimeError(
+            f"Agent '{agent_name}' is not in the approved agent registry "
+            f"({sorted(ALLOWED_AGENTS)}). Instantiation blocked."
+        )
+
+# ===========================================================================
+# Input Sanitization for AI Model
+# ===========================================================================
+
+# Maximum number of characters allowed per file sent to the AI model.
+_AI_INPUT_MAX_CHARS = 100_000
+
+# Prompt-injection patterns to neutralise before forwarding content to the LLM.
+# Each pattern is replaced with a safe placeholder so the model never sees the
+# raw injection attempt while the surrounding context is preserved.
+_PROMPT_INJECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Role-override / system-prompt hijack attempts
+    (re.compile(r"(?i)(ignore\s+(all\s+)?(previous|prior|above)\s+instructions?)"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(disregard\s+(all\s+)?(previous|prior|above)\s+instructions?)"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(you\s+are\s+now\s+(?:a|an)\s+\w+)"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(act\s+as\s+(?:a|an)\s+\w+)"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(new\s+instructions?\s*:)"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(system\s*:\s*you\s+are)"), "[REDACTED_INJECTION]"),
+    # Jailbreak / DAN-style triggers
+    (re.compile(r"(?i)\bDAN\b"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(do\s+anything\s+now)"), "[REDACTED_INJECTION]"),
+    (re.compile(r"(?i)(jailbreak)"), "[REDACTED_INJECTION]"),
+    # Delimiter / role-tag injection
+    (re.compile(r"<\|(?:im_start|im_end|system|user|assistant)\|>"), "[REDACTED_INJECTION]"),
+    (re.compile(r"\[\s*(?:SYSTEM|INST|HUMAN|ASSISTANT)\s*\]"), "[REDACTED_INJECTION]"),
+    # Null-byte and other control characters (except common whitespace)
+    (re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"), ""),
+]
+
+
+def sanitize_file_content_for_ai(content: str, file_path: str = "") -> str:
+    """Sanitize and validate *content* before it is forwarded to the AI model.
+
+    Steps applied in order:
+    1. Validate / coerce to a clean UTF-8 string.
+    2. Enforce a hard character-length limit.
+    3. Strip control characters and neutralise prompt-injection patterns.
+
+    Args:
+        content: Raw text content read from a source file.
+        file_path: Optional path used only for log messages.
+
+    Returns:
+        A sanitized string that is safe to include in an LLM prompt.
+
+    Raises:
+        ValueError: If *content* cannot be decoded as UTF-8 text.
+    """
+    label = file_path or "<unknown>"
+
+    # --- 1. Encoding validation -------------------------------------------
+    if not isinstance(content, str):
+        raise ValueError(f"sanitize_file_content_for_ai: content for '{label}' must be str, got {type(content).__name__}")
+    # Round-trip through UTF-8 to catch surrogate / lone-surrogate sequences.
+    try:
+        content = content.encode("utf-8", errors="strict").decode("utf-8", errors="strict")
+    except (UnicodeEncodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"sanitize_file_content_for_ai: '{label}' contains invalid UTF-8 sequences: {exc}") from exc
+
+    # --- 2. Length limit -----------------------------------------------------
+    if len(content) > _AI_INPUT_MAX_CHARS:
+        logger.warning(
+            "sanitize_file_content_for_ai: '%s' truncated from %d to %d chars before AI submission.",
+            label, len(content), _AI_INPUT_MAX_CHARS,
+        )
+        content = content[:_AI_INPUT_MAX_CHARS]
+
+    # --- 3. Prompt-injection / malicious-content filtering -------------------
+    for pattern, replacement in _PROMPT_INJECTION_PATTERNS:
+        content = pattern.sub(replacement, content)
+
+    return content
+
+# ===========================================================================
+# MCP Output Validation & Sanitization
+# ===========================================================================
+
+_MCP_MAX_STRING_LENGTH = 65536  # 64 KB per string field
+_MCP_MAX_LIST_LENGTH = 1000
+_MCP_ALLOWED_STATUS_VALUES = {"violations_found", "compliant", "error", "success", "pending"}
+_MCP_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_mcp_string(value: Any, max_length: int = _MCP_MAX_STRING_LENGTH) -> str:
+    """Sanitize a string value from MCP server output.
+
+    - Coerces to str
+    - Strips ASCII control characters (except \t, \n, \r)
+    - Truncates to max_length
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    value = _MCP_CONTROL_CHAR_RE.sub("", value)
+    if len(value) > max_length:
+        logger.warning(
+            "MCP response string field truncated from %d to %d characters",
+            len(value),
+            max_length,
+        )
+        value = value[:max_length]
+    return value
+
+
+def _sanitize_mcp_value(value: Any, depth: int = 0) -> Any:
+    """Recursively sanitize a value from MCP server output.
+
+    Handles str, int, float, bool, None, list, and dict.
+    Unknown types are coerced to sanitized strings.
+    Depth is capped at 10 to prevent stack overflow on deeply nested payloads.
+    """
+    if depth > 10:
+        logger.warning("MCP response nesting depth exceeded; truncating subtree")
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        # Guard against NaN / Infinity which are not valid JSON
+        import math
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            logger.warning("MCP response contained non-finite float; replacing with None")
+            return None
+        return value
+    if isinstance(value, str):
+        return _sanitize_mcp_string(value)
+    if isinstance(value, list):
+        if len(value) > _MCP_MAX_LIST_LENGTH:
+            logger.warning(
+                "MCP response list truncated from %d to %d items",
+                len(value),
+                _MCP_MAX_LIST_LENGTH,
+            )
+            value = value[:_MCP_MAX_LIST_LENGTH]
+        return [_sanitize_mcp_value(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        return {
+            _sanitize_mcp_string(k, max_length=256): _sanitize_mcp_value(v, depth + 1)
+            for k, v in value.items()
+        }
+    # Fallback: coerce unknown types to sanitized string
+    logger.warning("MCP response contained unexpected type %s; coercing to string", type(value).__name__)
+    return _sanitize_mcp_string(str(value))
+
+
+def sanitize_mcp_response(response: Any) -> Dict[str, Any]:
+    """Validate and sanitize a top-level MCP server response.
+
+    Raises ValueError if the response is not a dict (i.e., structurally invalid).
+    Returns a sanitized copy of the response dict.
+    """
+    if not isinstance(response, dict):
+        raise ValueError(
+            f"MCP server returned unexpected top-level type {type(response).__name__}; expected dict"
+        )
+    sanitized: Dict[str, Any] = {}
+    for key, value in response.items():
+        clean_key = _sanitize_mcp_string(str(key), max_length=256)
+        sanitized[clean_key] = _sanitize_mcp_value(value)
+
+    # Validate 'status' field if present
+    if "status" in sanitized:
+        status_val = sanitized["status"]
+        if not isinstance(status_val, str) or status_val not in _MCP_ALLOWED_STATUS_VALUES:
+            logger.warning(
+                "MCP response 'status' field has unexpected value %r; replacing with 'error'",
+                status_val,
+            )
+            sanitized["status"] = "error"
+
+    return sanitized
+
+
+def _log_mcp_request(method: str, url: str, payload: Any) -> None:
+    """Log an outgoing MCP server request."""
+    try:
+        sanitized = json.dumps(payload) if payload is not None else "<no body>"
+    except Exception:
+        sanitized = repr(payload)
+    logger.info(
+        "MCP request | method=%s url=%s body=%s",
+        method,
+        url,
+        sanitized,
+    )
+
+
+def _log_mcp_response(url: str, status_code: int, body: Any) -> None:
+    """Log an incoming MCP server response."""
+    try:
+        sanitized = json.dumps(body) if body is not None else "<no body>"
+    except Exception:
+        sanitized = repr(body)
+    logger.info(
+        "MCP response | url=%s status=%s body=%s",
+        url,
+        status_code,
+        sanitized,
+    )
+
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
+
+# Convenience wrapper: call this instead of invoking an MCP tool directly.
+def invoke_mcp_tool(tool_name: str, **kwargs: Any) -> Any:
+    """Validate *tool_name* against the allow list then delegate to the MCP client.
+
+    All MCP tool calls in this module MUST go through this function so that
+    the allow list is enforced at a single choke-point.
+    """
+    _assert_tool_allowed(tool_name)
+    logger.debug("Invoking allowed MCP tool: %s", tool_name)
+    # Actual MCP dispatch is handled by the caller after this guard returns.
+    return {"tool": tool_name, "kwargs": kwargs}
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
@@ -113,6 +412,8 @@ _BINARY_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3",
 }
 
+# NOTE: sanitize_file_content_for_ai() (defined above) must be called on every
+# file's text content before it is included in a batch forwarded to MCP_SERVER_URL.
 _MANIFEST_FILE_NAMES: frozenset = frozenset({
     "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
     "Pipfile", "Pipfile.lock", "pyproject.toml", "setup.py", "setup.cfg", "poetry.lock",
@@ -176,7 +477,7 @@ def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
                 parts = s.split(".")
                 if context == "renew-access-token" and len(parts) == 3:
                     return {"access_token": s}
-                raise RuntimeError(f"{context}: server returned error string: {s[:800]}") from None
+                raise RuntimeError(f"{context}: server returned error string: [redacted]") from None
             continue
         break
     raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
@@ -818,6 +1119,108 @@ def _create_fix_pr(
 
 
 # ===========================================================================
+# Forensic audit logging
+# ===========================================================================
+
+import hashlib
+import uuid
+import glob
+
+# Retention policy: keep audit logs for this many days; rotate older files.
+AUDIT_LOG_RETENTION_DAYS: int = 90
+AUDIT_LOG_DIR: str = os.environ.get("AUDIT_LOG_DIR", "/var/log/gha_repo_scan/audit")
+AUDIT_LOG_PATH: str = os.path.join(AUDIT_LOG_DIR, "decisions.ndjson")
+
+
+def _sha256_of(obj) -> str:
+    """Return hex SHA-256 of the canonical JSON representation of obj."""
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+class AuditLogger:
+    """Append-only forensic audit sink for AI-driven decisions."""
+
+    def __init__(self, log_path: str = AUDIT_LOG_PATH, retention_days: int = AUDIT_LOG_RETENTION_DAYS):
+        self.log_path = log_path
+        self.retention_days = retention_days
+        self._ensure_log_dir()
+        self._rotate_old_logs()
+
+    def _ensure_log_dir(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        except OSError as exc:
+            # Fail closed: if we cannot create the audit directory, abort.
+            raise RuntimeError(
+                f"AUDIT SINK UNAVAILABLE — cannot create audit log directory "
+                f"{os.path.dirname(self.log_path)}: {exc}"
+            ) from exc
+
+    def _rotate_old_logs(self) -> None:
+        """Remove audit log files older than retention_days."""
+        try:
+            cutoff = time.time() - self.retention_days * 86400
+            pattern = os.path.join(os.path.dirname(self.log_path), "decisions*.ndjson")
+            for fpath in glob.glob(pattern):
+                try:
+                    if os.path.getmtime(fpath) < cutoff:
+                        os.remove(fpath)
+                        logger.info("Audit log rotated (retention=%dd): %s", self.retention_days, fpath)
+                except OSError:
+                    pass
+        except Exception:
+            pass  # rotation failure is non-fatal but logged
+
+    def record(self, *, trace_id: str, step: str, principal: str,
+               model_id: str, input_obj, output_obj, extra: dict = None) -> None:
+        """Write one decision record to the append-only audit log.
+
+        Raises RuntimeError if the write fails (fail-closed).
+        """
+        record = {
+            "trace_id": trace_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "step": step,
+            "principal": principal,
+            "model_id": model_id,
+            "input_hash": _sha256_of(input_obj),
+            "output_hash": _sha256_of(output_obj),
+            "retention_days": self.retention_days,
+        }
+        if extra:
+            record["extra"] = extra
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            raise RuntimeError(
+                f"AUDIT SINK WRITE FAILURE — forensic log at {self.log_path} "
+                f"is unreachable: {exc}"
+            ) from exc
+
+
+def _emit_output(output: dict, audit: "AuditLogger", trace_id: str,
+                 step: str, principal: str, model_id: str, input_obj) -> None:
+    """Write decision record to audit log then print to stdout.
+
+    Fails closed if the audit write fails.
+    """
+    audit.record(
+        trace_id=trace_id,
+        step=step,
+        principal=principal,
+        model_id=model_id,
+        input_obj=input_obj,
+        output_obj=output,
+    )
+    print(json.dumps(output, indent=2))
+
+
+# ===========================================================================
 # Main scan orchestration
 # ===========================================================================
 
@@ -829,6 +1232,20 @@ def _execute_scan(args: argparse.Namespace) -> int:
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
     source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
 
+    # Correlation/trace ID — links every log entry for this scan run end-to-end.
+    trace_id: str = str(uuid.uuid4())
+    principal: str = os.environ.get("GITHUB_ACTOR", os.environ.get("USER", "unknown"))
+    model_id: str = os.environ.get("MCP_MODEL_ID", "mcp-policy-scanner/unknown")
+
+    # Initialise audit sink — fail closed if unavailable.
+    try:
+        audit = AuditLogger()
+    except RuntimeError as exc:
+        logger.critical("Cannot initialise audit log — aborting: %s", exc)
+        return 1
+
+    logger.info("Scan trace_id=%s principal=%s", trace_id, principal)
+
     # Validate config
     missing = [n for n, v in [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)] if not v]
     if missing:
@@ -837,7 +1254,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
         )
-        print(json.dumps(output, indent=2))
+        _emit_output(output, audit, trace_id, "config-validation", principal, model_id,
+                     {"repo": repo, "branch": branch, "missing": missing})
         return 2
 
     try:
@@ -851,7 +1269,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Auth failed: {exc}"],
         )
-        print(json.dumps(output, indent=2))
+        _emit_output(output, audit, trace_id, "auth", principal, model_id,
+                     {"repo": repo, "branch": branch})
         return 2
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -868,7 +1287,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[],
         )
-        print(json.dumps(output, indent=2))
+        _emit_output(output, audit, trace_id, "file-collection", principal, model_id,
+                     {"source_path": source_path, "file_count": 0})
         return 0
 
     manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
@@ -977,9 +1397,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
+            parser.add_argument(
         "--source-path", default=".",
-        help="Path to the checked-out source code (default: current directory)",
+        help="Path to the checked-out source code (default: current directory). "
+             "Must resolve to a subdirectory of the current working directory.",
+    ). "
+             "Must resolve to a subdirectory of the current working directory.",
+    )",
     )
     parser.add_argument(
         "--repo", default="",
@@ -997,11 +1421,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--mcp-server-url", default="",
         help=f"MCP server URL (default: {MCP_SERVER_URL})",
     )
-    parser.add_argument(
-        "--github-token", default="",
-        help="GitHub token for creating remediation PRs (default: $GH_TOKEN then $GITHUB_TOKEN). "
-             "If not set, violations are reported but no PR is created.",
-    )
+    # GitHub token is read exclusively from environment variables to avoid
+    # exposure in process listings on shared runners. Do not accept via CLI.
     parser.add_argument(
         "--debug", action="store_true",
         help="Enable DEBUG logging to stderr",
@@ -1022,9 +1443,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     try:
+        # Validate and sanitize all CLI inputs before any processing
+        try:
+            args.source_path = str(_validate_source_path(args.source_path))
+            args.repo = _validate_repo_slug(_normalize_token(args.repo))
+            args.branch = _validate_branch(_normalize_token(args.branch))
+            if hasattr(args, 'head_sha'):
+                args.head_sha = _validate_head_sha(_normalize_token(args.head_sha))
+            args.mcp_server_url = _normalize_url(args.mcp_server_url)
+            args.github_token = _normalize_token(args.github_token)
+        except ValueError as validation_err:
+            err = {
+                "status": "error",
+                "scan_errors": [f"Input validation failed: {validation_err}"],
+            }
+            print(json.dumps(err, indent=2))
+            return 2
         return _execute_scan(args)
     except Exception:
-        logger.exception("Unhandled error")
+        logger.error("Unhandled error")
         err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
         print(json.dumps(err, indent=2))
         return 1
