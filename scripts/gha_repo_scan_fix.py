@@ -567,16 +567,17 @@ def print_human_output(output: Dict[str, Any]) -> None:
     else:
         status_label = status
 
-    print(f"Status: {status_label}")
+    print(f"**Status:** {status_label}")
 
     if scan_errors:
+        print("\n**Errors:**")
         for err in scan_errors:
-            print(f"  Error: {err}")
+            print(f"- {err}")
         print()
 
     if not violations:
         if status == "compliant":
-            print("No violations found.")
+            print("\nNo violations found.")
         return
 
     from collections import defaultdict
@@ -587,22 +588,14 @@ def print_human_output(output: Dict[str, Any]) -> None:
         by_file[file_].append(control)
 
     num_files = len(by_file)
-    print(f"{len(violations)} violation(s) across {num_files} file(s)\n")
+    print(f"\n**{len(violations)} violation(s) across {num_files} file(s)**\n")
 
-    col_file = 40
-    col_controls = 60
-    print(f"{'File':<{col_file}}  Controls")
-    print("-" * (col_file + 2 + col_controls))
+    print("| File | Policy Violations |")
+    print("|------|-------------------|")
 
     for file_, controls in sorted(by_file.items()):
-        first = True
-        for ctrl in controls:
-            if first:
-                print(f"{file_:<{col_file}}  {ctrl}")
-                first = False
-            else:
-                print(f"{'':<{col_file}}  {ctrl}")
-        print()
+        controls_cell = "<br>".join(controls)
+        print(f"| `{file_}` | {controls_cell} |")
 
 
 # ===========================================================================
@@ -1055,8 +1048,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--create-fix-pr", default=True, action=argparse.BooleanOptionalAction,
-        help="Create a remediation PR with fix_code patches (default: true). "
-             "Use --no-create-fix-pr to skip PR creation.",
+        help="Create a remediation PR with fix_code patches (default: true). ",
     )
     parser.add_argument(
         "--debug", action="store_true",
