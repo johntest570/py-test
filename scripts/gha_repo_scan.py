@@ -65,10 +65,201 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger("gha_repo_scan")
 
 # ===========================================================================
+# Input Validation & Sanitization
+# ===========================================================================
+
+_MAX_REPO_SLUG_LEN = 200
+_MAX_BRANCH_LEN = 255
+_MAX_SHA_LEN = 64
+_MAX_URL_LEN = 2048
+_MAX_PATH_LEN = 4096
+_MAX_FILE_CONTENT_LEN = 512 * 1024  # 512 KB per file
+_MAX_ENV_VAR_LEN = 1024
+
+# Allowlist of trusted MCP server hostname suffixes
+_MCP_URL_ALLOWLIST = [
+    "veedna.com",
+    "lineaje.com",
+]
+
+_REPO_SLUG_RE = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+_BRANCH_RE = re.compile(r'^[A-Za-z0-9_./:@#%+\-]+$')
+_SHA_RE = re.compile(r'^[0-9a-fA-F]{7,64}$')
+
+
+def _sanitize_str(value: str, max_len: int, label: str) -> str:
+    """Truncate and strip a string; raise ValueError if empty after stripping."""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    value = value.strip()
+    if len(value) > max_len:
+        logger.warning("%s exceeds max length %d; truncating", label, max_len)
+        value = value[:max_len]
+    return value
+
+
+def _validate_repo_slug(repo: str) -> str:
+    """Validate and return a sanitized owner/repo slug."""
+    repo = _sanitize_str(repo, _MAX_REPO_SLUG_LEN, "repo")
+    if not _REPO_SLUG_RE.match(repo):
+        raise ValueError(
+            f"Invalid repo slug {repo!r}. Expected 'owner/repo' with "
+            "alphanumeric characters, hyphens, underscores, or dots."
+        )
+    return repo
+
+
+def _validate_branch(branch: str) -> str:
+    """Validate and return a sanitized branch name."""
+    branch = _sanitize_str(branch, _MAX_BRANCH_LEN, "branch")
+    if not _BRANCH_RE.match(branch):
+        raise ValueError(
+            f"Invalid branch name {branch!r}. Only alphanumeric characters, "
+            "hyphens, underscores, dots, slashes, colons, at-signs, "
+            "percent signs, and plus signs are allowed."
+        )
+    return branch
+
+
+def _validate_sha(sha: str) -> str:
+    """Validate and return a sanitized Git SHA."""
+    sha = _sanitize_str(sha, _MAX_SHA_LEN, "head-sha")
+    if not _SHA_RE.match(sha):
+        raise ValueError(
+            f"Invalid Git SHA {sha!r}. Expected 7-64 hex characters."
+        )
+    return sha
+
+
+def _validate_source_path(path_str: str) -> pathlib.Path:
+    """Validate that source-path is a real, accessible directory."""
+    path_str = _sanitize_str(path_str, _MAX_PATH_LEN, "source-path")
+    p = pathlib.Path(path_str).resolve()
+    if not p.exists():
+        raise ValueError(f"source-path does not exist: {p}")
+    if not p.is_dir():
+        raise ValueError(f"source-path is not a directory: {p}")
+    return p
+
+
+def _validate_mcp_url(url: str) -> str:
+    """Validate the MCP server URL against an allowlist of trusted domains."""
+    url = _sanitize_str(url, _MAX_URL_LEN, "mcp-server-url")
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"Cannot parse MCP server URL: {exc}") from exc
+    if parsed.scheme not in ("https",):
+        raise ValueError(
+            f"MCP server URL must use HTTPS scheme, got {parsed.scheme!r}"
+        )
+    hostname = (parsed.hostname or "").lower()
+    if not any(hostname == allowed or hostname.endswith("." + allowed)
+               for allowed in _MCP_URL_ALLOWLIST):
+        raise ValueError(
+            f"MCP server URL hostname {hostname!r} is not in the trusted "
+            f"allowlist: {_MCP_URL_ALLOWLIST}"
+        )
+    return url
+
+
+def _sanitize_env_var(name: str) -> str:
+    """Read an environment variable and sanitize it."""
+    value = os.environ.get(name, "")
+    value = _sanitize_str(value, _MAX_ENV_VAR_LEN, f"env:{name}")
+    # Strip any ASCII control characters
+    value = re.sub(r'[\x00-\x1f\x7f]', '', value)
+    return value
+
+
+def _sanitize_file_content(content: str, filepath: str) -> str:
+    """Sanitize file content before inclusion in an MCP payload."""
+    if not isinstance(content, str):
+        content = str(content)
+    if len(content) > _MAX_FILE_CONTENT_LEN:
+        logger.warning(
+            "File %s content truncated from %d to %d bytes",
+            filepath, len(content), _MAX_FILE_CONTENT_LEN,
+        )
+        content = content[:_MAX_FILE_CONTENT_LEN]
+    # Remove null bytes which can cause issues in JSON payloads
+    content = content.replace('\x00', '')
+    return content
+
+
+# ===========================================================================
 # Constants
 # ===========================================================================
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+
+# ---------------------------------------------------------------------------
+# Tool allow list — ONLY tools listed here may be invoked via the MCP client.
+# Any tool not present in this set will be denied and audited before execution.
+# ---------------------------------------------------------------------------
+TOOL_ALLOW_LIST: frozenset = frozenset({
+    "scan_files",
+    "scan_repository",
+    "get_policy_report",
+    "get_aibom",
+    "get_violations",
+})
+
+_POLICY_VERSION = "1.0.0"
+
+
+def _audit_log(event: str, tool_id: str, actor: str, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+    """Write a structured audit entry to stderr (protected sink).
+
+    Fields logged:
+        event        — 'tool_denied' | 'tool_invocation_failed' | 'tool_allowed'
+        tool_id      — the tool name that was requested
+        actor        — identity of the caller (repo/branch/sha)
+        policy_ver   — version of the allow list policy in effect
+        reason       — human-readable denial or failure reason
+        timestamp    — ISO-8601 UTC timestamp
+        extra        — optional additional context
+    """
+    entry: Dict[str, Any] = {
+        "audit_event": event,
+        "tool_id": tool_id,
+        "actor": actor,
+        "policy_version": _POLICY_VERSION,
+        "reason": reason,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra:
+        entry["extra"] = extra
+    # Write to stderr so it is captured by the runner log and not mixed with
+    # the structured JSON output on stdout.
+    print(json.dumps({"AUDIT": entry}), file=sys.stderr, flush=True)
+
+
+def _enforce_tool_allow_list(tool_id: str, actor: str) -> None:
+    """Raise RuntimeError (fail-closed) if *tool_id* is not in TOOL_ALLOW_LIST.
+
+    Always emits an audit log entry — 'tool_allowed' on success,
+    'tool_denied' on failure.
+    """
+    if tool_id not in TOOL_ALLOW_LIST:
+        _audit_log(
+            event="tool_denied",
+            tool_id=tool_id,
+            actor=actor,
+            reason=f"Tool '{tool_id}' is not in the approved allow list.",
+        )
+        raise RuntimeError(
+            f"Policy violation: tool '{tool_id}' is not permitted. "
+            f"Allowed tools: {sorted(TOOL_ALLOW_LIST)}"
+        )
+    _audit_log(
+        event="tool_allowed",
+        tool_id=tool_id,
+        actor=actor,
+        reason="Tool is in the approved allow list.",
+    )
+
+logger.info("[MCP] MCP server URL configured: %s", MCP_SERVER_URL)
 
 MAX_SCAN_WORKERS = 4
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
@@ -152,6 +343,27 @@ def _normalize_url(url: Optional[str]) -> str:
     return u
 
 
+_ALLOWED_RENEW_URL_PREFIXES = (
+    "https://api.lineaje.ai/",
+    "https://api.lineaje.dev/",
+    "https://api.lineaje.cloud/",
+)
+
+
+def _validate_renew_url(url: str) -> str:
+    """Validate that a renew URL belongs to an allowed Lineaje domain (SSRF prevention)."""
+    if not url:
+        return url
+    normalized = url.rstrip("/") + "/"
+    for prefix in _ALLOWED_RENEW_URL_PREFIXES:
+        if normalized.startswith(prefix):
+            return url
+    raise ValueError(
+        f"LINEAJE_RENEW_ACCESS_TOKEN_URL must start with one of the allowed prefixes: "
+        f"{_ALLOWED_RENEW_URL_PREFIXES}. Got: {url!r}"
+    )
+
+
 def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
     text = raw_text.strip() if raw_text else ""
     try:
@@ -162,23 +374,29 @@ def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
         if context == "renew-access-token" and len(parts) == 3:
             return {"access_token": text}
         raise RuntimeError(f"{context}: response is not valid JSON") from None
-    for _ in range(8):
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, str):
-            s = parsed.strip()
-            if not s:
-                raise RuntimeError(f"{context}: empty JSON string where object expected")
-            try:
-                parsed = json.loads(s)
-            except json.JSONDecodeError:
-                parts = s.split(".")
-                if context == "renew-access-token" and len(parts) == 3:
-                    return {"access_token": s}
-                raise RuntimeError(f"{context}: server returned error string: {s[:800]}") from None
-            continue
-        break
-    raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
+    # Allow at most one level of JSON-string unwrapping to prevent insecure
+    # deserialization from deeply nested or crafted server payloads.
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, str):
+        s = parsed.strip()
+        if not s:
+            raise RuntimeError(f"{context}: empty JSON string where object expected")
+        try:
+            inner: Any = json.loads(s)
+        except json.JSONDecodeError:
+            parts = s.split(".")
+            if context == "renew-access-token" and len(parts) == 3:
+                return {"access_token": s}
+            # Do not include raw server response in the error message to avoid
+            # leaking sensitive token material into logs.
+            raise RuntimeError(f"{context}: server returned an unparseable response") from None
+        if isinstance(inner, dict):
+            return inner
+        raise RuntimeError(
+            f"{context}: unexpected JSON type after single unwrap: {type(inner).__name__}"
+        )
+    raise RuntimeError(f"{context}: unexpected JSON type: {type(parsed).__name__}")
 
 
 class RefreshTokenTokenManager:
@@ -188,9 +406,15 @@ class RefreshTokenTokenManager:
         self._refresh_token = _normalize_token(refresh_token)
         if not self._refresh_token:
             raise ValueError("LINEAJE_PAT_TOKEN must be non-empty")
+        _explicit_url = _normalize_url(renew_access_token_url)
+        _env_url = _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
+        if _env_url:
+            _validate_renew_url(_env_url)
+        if _explicit_url:
+            _validate_renew_url(_explicit_url)
         self._renew_url = (
-            _normalize_url(renew_access_token_url)
-            or _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
+            _explicit_url
+            or _env_url
             or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
         ).rstrip("/")
         self._lock = threading.Lock()
@@ -217,13 +441,16 @@ class RefreshTokenTokenManager:
         return self._access_token
 
     def _renew(self) -> None:
+        logger.info("[MCP] Initiating token renewal interaction with identity service: %s", _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD)
         q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
         url = f"{self._renew_url}?{q}"
+                logger.info("[MCP] Token renewal request payload: %s", json.dumps({k: ("***" if k == "refreshToken" else v) for k, v in payload.items()}))
         req = urllib.request.Request(
-            url, data=b"null",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+                self._renew_url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
@@ -551,13 +778,114 @@ def build_json_output(
 # Main scan orchestration
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Output sanitisation helpers (data minimisation / rule 4)
+# ---------------------------------------------------------------------------
+
+_VIOLATION_ALLOWLIST: frozenset = frozenset({
+    "rule_id", "severity", "message", "file", "line", "column",
+    "category", "recommendation",
+})
+
+_AIBOM_ALLOWLIST: frozenset = frozenset({
+    "name", "version", "type", "license", "ecosystem",
+})
+
+import re as _re
+
+_SENSITIVE_PATH_RE = _re.compile(
+    r"(?:/[\w.\-]+){2,}|[A-Za-z]:\\[\w\\]+|\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"
+    r"|Traceback \(most recent call last\)|File \"[^\"]+\""
+)
+
+
+def _sanitise_violation(v: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only allowlisted keys from a violation dict."""
+    return {k: val for k, val in v.items() if k in _VIOLATION_ALLOWLIST}
+
+
+def _sanitise_aibom_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only allowlisted keys from an AIBOM entry dict."""
+    return {k: val for k, val in entry.items() if k in _AIBOM_ALLOWLIST}
+
+
+def _sanitise_error(msg: str) -> str:
+    """Redact file paths, IPs, and stack-trace fragments from error strings."""
+    return _SENSITIVE_PATH_RE.sub("[redacted]", str(msg))
+
+
+def _sanitise_output(output: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply field allowlists and error redaction to the final output dict."""
+    sanitised = dict(output)
+    if "violations" in sanitised and isinstance(sanitised["violations"], list):
+        sanitised["violations"] = [
+            _sanitise_violation(v) for v in sanitised["violations"]
+            if isinstance(v, dict)
+        ]
+    if "aibom" in sanitised and isinstance(sanitised["aibom"], list):
+        sanitised["aibom"] = [
+            _sanitise_aibom_entry(e) for e in sanitised["aibom"]
+            if isinstance(e, dict)
+        ]
+    if "scan_errors" in sanitised and isinstance(sanitised["scan_errors"], list):
+        sanitised["scan_errors"] = [
+            _sanitise_error(e) for e in sanitised["scan_errors"]
+        ]
+    return sanitised
+
+
+# ---------------------------------------------------------------------------
+# Audit / forensic helpers
+# ---------------------------------------------------------------------------
+AUDIT_LOG_PATH = os.environ.get("AI_AUDIT_LOG_PATH", "/var/log/gha_repo_scan_audit.jsonl")
+AUDIT_LOG_RETENTION_DAYS = int(os.environ.get("AI_AUDIT_LOG_RETENTION_DAYS", "365"))
+MODEL_IDENTIFIER = os.environ.get("AI_MODEL_IDENTIFIER", "lineaje-policy-scanner/v1")
+
+
+def _write_audit_record(record: Dict[str, Any], fail_closed: bool = True) -> None:
+    """Append an audit record to the immutable audit log (JSONL, append-only).
+
+    Parameters
+    ----------
+    record:
+        The audit record dict to persist.
+    fail_closed:
+        When True (default) any failure to write raises, causing the caller to
+        abort rather than silently continue without an audit trail.
+    """
+    try:
+        audit_dir = os.path.dirname(AUDIT_LOG_PATH)
+        if audit_dir:
+            os.makedirs(audit_dir, exist_ok=True)
+        # Open in append mode; each line is an independent JSON record (JSONL).
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("AUDIT SINK UNREACHABLE — failed to write audit record: %s", exc)
+        if fail_closed:
+            raise RuntimeError(f"Audit sink unreachable: {exc}") from exc
+
+
+def _sha256_of(obj: Any) -> str:
+    """Return the SHA-256 hex digest of the canonical JSON representation of *obj*."""
+    canonical = json.dumps(obj, sort_keys=True, default=str).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _execute_scan(args: argparse.Namespace) -> int:
+    # Generate a unique trace/correlation ID for this entire scan run so that
+    # every batch-level audit record can be linked back to the top-level scan.
+    trace_id = str(uuid.uuid4())
+
     repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "")
     branch = args.branch or os.environ.get("GITHUB_REF_NAME", "")
     head_sha = args.head_sha or os.environ.get("GITHUB_SHA", "")
     source_path = os.path.abspath(args.source_path)
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
     source_code_repo = f"https://github.com/{repo}.git" if repo else source_path
+    principal = os.environ.get("GITHUB_ACTOR", os.environ.get("USER", "unknown"))
 
     # Validate config
     missing = [n for n, v in [("GITHUB_REPOSITORY / --repo", repo), ("GITHUB_REF_NAME / --branch", branch)] if not v]
@@ -567,7 +895,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[], scan_errors=[f"Missing required config: {', '.join(missing)}"],
         )
-        print(json.dumps(output, indent=2))
+        print(json.dumps(_sanitise_output(output), indent=2))
         return 2
 
     try:
@@ -576,16 +904,37 @@ def _execute_scan(args: argparse.Namespace) -> int:
         bearer_getter()
         logger.info("Auth OK — LINEAJE_PAT_TOKEN accepted")
     except Exception as exc:
+        logger.error("Auth failed: %s", exc)
         output = build_json_output(
             status="error", repo=repo, branch=branch, head_sha=head_sha,
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
-            violations=[], scan_errors=[f"Auth failed: {exc}"],
+            violations=[], scan_errors=["Authentication failed — see stderr logs"],
         )
-        print(json.dumps(output, indent=2))
+        print(json.dumps(_sanitise_output(output), indent=2))
         return 2
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     scan_start = time.perf_counter()
+
+    # Write the scan-start audit record so the decision chain begins immediately.
+    scan_start_input = {
+        "repo": repo,
+        "branch": branch,
+        "head_sha": head_sha,
+        "source_path": source_path,
+        "server_url": server_url,
+    }
+    _write_audit_record({
+        "event": "scan_start",
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "principal": principal,
+        "model": MODEL_IDENTIFIER,
+        "input_hash": _sha256_of(scan_start_input),
+        "retention_days": AUDIT_LOG_RETENTION_DAYS,
+        "audit_log_path": AUDIT_LOG_PATH,
+    })
 
     logger.info("Scanning source path: %s (repo=%s branch=%s sha=%s)", source_path, repo, branch, head_sha[:7] if head_sha else "?")
 
@@ -598,7 +947,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
             source_code_repo=source_code_repo, files_scanned=0, batches=0, failed_batches=0,
             violations=[],
         )
-        print(json.dumps(output, indent=2))
+        print(json.dumps(_sanitise_output(output), indent=2))
         return 0
 
     manifest_files = [f for f in file_list if _is_manifest_file(os.path.basename(f))]
@@ -634,6 +983,11 @@ def _execute_scan(args: argparse.Namespace) -> int:
 
     combined_report = "\n\n---\n\n".join(r for r in all_reports if r)
 
+    # Sanitize MCP server output before use
+    all_violations = _sanitize_mcp_list(all_violations)
+    all_aibom = _sanitize_mcp_list(all_aibom)
+    combined_report = _sanitize_mcp_string(combined_report)
+
     if failed_batches_count and not all_violations:
         output = build_json_output(
             status="error", repo=repo, branch=branch, head_sha=head_sha,
@@ -643,25 +997,196 @@ def _execute_scan(args: argparse.Namespace) -> int:
             scan_errors=failure_details,
         )
         print(json.dumps(output, indent=2))
+
+    # Persist the final decision audit record to the append-only audit log.
+    _write_audit_record({
+        "event": "scan_decision",
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "principal": principal,
+        "model": MODEL_IDENTIFIER,
+        "input_hash": _sha256_of(scan_start_input),
+        "output_hash": _sha256_of(output),
+        "status": output.get("status"),
+        "files_scanned": output.get("scan_metadata", {}).get("files_scanned"),
+        "violations_count": len(output.get("violations", [])),
+        "failed_batches": output.get("scan_metadata", {}).get("failed_batches"),
+        "retention_days": AUDIT_LOG_RETENTION_DAYS,
+        "audit_log_path": AUDIT_LOG_PATH,
+    })
         return 1
 
     status = "compliant" if not all_violations else "violations_found"
     if failed_batches_count:
         status = "error"
-
-    output = build_json_output(
+        # Audit every batch failure so there is a record of which tool
+        # invocations did not complete successfully.
+        actor_id = f"{repo}@{branch}#{head_sha}"
+        for _fd in failure_details:
+            _audit_log(
+                event="tool_invocation_failed",
+                tool_id=_fd.get("tool", "scan_files"),
+                actor=actor_id,
+                reason=_fd.get("error", "unknown batch failure"),
+                extra={"batch_index": _fd.get("batch_index"), "files": _fd.get("files")},
+            )
+output = build_json_output(
         status=status, repo=repo, branch=branch, head_sha=head_sha,
         source_code_repo=source_code_repo, files_scanned=len(file_list),
         batches=len(batches), failed_batches=failed_batches_count,
         violations=all_violations, aibom=all_aibom, report=combined_report,
         scan_errors=failure_details,
+    ) for v in all_violations if isinstance(v, dict)]
+    sanitised_aibom = [_sanitise_aibom_entry(e) for e in all_aibom if isinstance(e, dict)]
+    sanitised_errors = [_sanitise_error(e) for e in failure_details]
+    output = build_json_output(
+        status=status, repo=repo, branch=branch, head_sha=head_sha,
+        source_code_repo=source_code_repo, files_scanned=len(file_list),
+        batches=len(batches), failed_batches=failed_batches_count,
+        violations=sanitised_violations, aibom=sanitised_aibom, report=combined_report,
+        scan_errors=sanitised_errors,
     )
-    print(json.dumps(output, indent=2))
+    print(json.dumps(_sanitise_output(output), indent=2))
     return 0
 
 # ===========================================================================
 # CLI
 # ===========================================================================
+
+_MCP_STRING_MAX_LEN = 1_000_000
+_MCP_FIELD_MAX_LEN = 65_536
+_MCP_MAX_ITEMS = 10_000
+_ALLOWED_SCALAR_TYPES = (str, int, float, bool, type(None))
+import re as _re
+
+
+def _sanitize_mcp_string(value: object, max_len: int = _MCP_STRING_MAX_LEN) -> str:
+    """Validate and sanitize a string received from an MCP server."""
+    if not isinstance(value, str):
+        logger.warning("MCP output: expected str, got %s; coercing", type(value).__name__)
+        value = str(value) if value is not None else ""
+    # Remove non-printable characters except common whitespace
+    value = _re.sub(r"[^\x09\x0a\x0d\x20-\x7e\x80-\ufffd]", "", value)
+    if len(value) > max_len:
+        logger.warning("MCP output string truncated from %d to %d chars", len(value), max_len)
+        value = value[:max_len]
+    return value
+
+
+def _sanitize_mcp_scalar(value: object, max_len: int = _MCP_FIELD_MAX_LEN) -> object:
+    """Sanitize a scalar field value from an MCP server response."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if value is None:
+        return value
+    if isinstance(value, str):
+        return _sanitize_mcp_string(value, max_len=max_len)
+    # Reject unexpected types
+    logger.warning("MCP output: unexpected scalar type %s; replacing with None", type(value).__name__)
+    return None
+
+
+def _sanitize_mcp_dict(item: object) -> dict:
+    """Validate and sanitize a single dict item from an MCP server list response."""
+    if not isinstance(item, dict):
+        logger.warning("MCP output: expected dict item, got %s; skipping", type(item).__name__)
+        return {}
+    sanitized: dict = {}
+    for k, v in item.items():
+        # Keys must be non-empty strings
+        if not isinstance(k, str) or not k.strip():
+            logger.warning("MCP output: invalid key %r; skipping field", k)
+            continue
+        safe_key = _sanitize_mcp_string(k, max_len=256)
+        # Values may be scalars or flat lists of scalars
+        if isinstance(v, list):
+            sanitized[safe_key] = [
+                _sanitize_mcp_scalar(elem)
+                for elem in v
+                if isinstance(elem, _ALLOWED_SCALAR_TYPES)
+            ]
+        elif isinstance(v, _ALLOWED_SCALAR_TYPES):
+            sanitized[safe_key] = _sanitize_mcp_scalar(v)
+        else:
+            logger.warning(
+                "MCP output: field %r has unsupported type %s; replacing with None",
+                safe_key, type(v).__name__,
+            )
+            sanitized[safe_key] = None
+    return sanitized
+
+
+def _sanitize_mcp_list(items: object, max_items: int = _MCP_MAX_ITEMS) -> list:
+    """Validate and sanitize a list of dicts received from an MCP server."""
+    if not isinstance(items, list):
+        logger.warning("MCP output: expected list, got %s; returning empty list", type(items).__name__)
+        return []
+    if len(items) > max_items:
+        logger.warning("MCP output list truncated from %d to %d items", len(items), max_items)
+        items = items[:max_items]
+    result = []
+    for item in items:
+        sanitized = _sanitize_mcp_dict(item)
+        if sanitized:
+            result.append(sanitized)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# URL allowlist enforcement
+# ---------------------------------------------------------------------------
+
+_ALLOWED_MCP_HOSTNAMES: frozenset = frozenset({
+    # Add permitted MCP server hostnames here, e.g.:
+    # "mcp.lineaje.com",
+    # "mcp-staging.lineaje.com",
+})
+
+_ALLOWED_RENEW_HOSTNAMES: frozenset = frozenset({
+    # Add permitted token-renewal hostnames here, e.g.:
+    # "auth.lineaje.com",
+    # "api.lineaje.com",
+})
+
+_ALLOWED_SCHEMES: frozenset = frozenset({"https"})
+
+
+def _validate_url_allowlist(url: str, allowed_hostnames: frozenset, label: str) -> str:
+    """Validate *url* against an explicit hostname allowlist.
+
+    Raises ValueError if the URL does not pass validation so that no outbound
+    HTTP request is ever made to an unvetted host.
+    """
+    if not url:
+        raise ValueError(f"{label}: URL must not be empty.")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"{label}: Failed to parse URL {url!r}: {exc}") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"{label}: URL scheme {scheme!r} is not permitted. "
+            f"Allowed schemes: {sorted(_ALLOWED_SCHEMES)}"
+        )
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError(f"{label}: URL {url!r} has no hostname.")
+
+    if allowed_hostnames and hostname not in allowed_hostnames:
+        raise ValueError(
+            f"{label}: Hostname {hostname!r} is not in the allowlist. "
+            f"Allowed hostnames: {sorted(allowed_hostnames)}"
+        )
+
+    return url
+
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -687,7 +1212,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mcp-server-url", default="",
-        help=f"MCP server URL (default: {MCP_SERVER_URL})",
+        help=f"MCP server URL (default: {MCP_SERVER_URL}). Must match the configured MCP hostname allowlist.",
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -708,12 +1233,93 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Always show INFO from this logger regardless of --debug
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
+    # --- Validate and sanitize all inputs before executing the scan ---
+    try:
+        # Validate source path
+        args.source_path = str(_validate_source_path(args.source_path))
+
+        # Resolve and validate repo slug
+        repo_raw = args.repo or _sanitize_env_var("GITHUB_REPOSITORY")
+        if not repo_raw:
+            logger.error("Repository slug is required (--repo or $GITHUB_REPOSITORY)")
+            return 2
+        args.repo = _validate_repo_slug(repo_raw)
+
+        # Resolve and validate branch
+        branch_raw = args.branch or _sanitize_env_var("GITHUB_REF_NAME")
+        if not branch_raw:
+            logger.error("Branch name is required (--branch or $GITHUB_REF_NAME)")
+            return 2
+        args.branch = _validate_branch(branch_raw)
+
+        # Resolve and validate head SHA
+        sha_raw = getattr(args, "head_sha", "") or _sanitize_env_var("GITHUB_SHA")
+        if sha_raw:
+            args.head_sha = _validate_sha(sha_raw)
+        else:
+            args.head_sha = ""
+
+        # Validate MCP server URL
+        mcp_url_raw = args.mcp_server_url if args.mcp_server_url else MCP_SERVER_URL
+        args.mcp_server_url = _validate_mcp_url(mcp_url_raw)
+
+        # Sanitize the PAT token env var (length + control-char strip)
+        pat_token = _sanitize_env_var("LINEAJE_PAT_TOKEN")
+        if not pat_token:
+            logger.error("LINEAJE_PAT_TOKEN environment variable is not set")
+            return 2
+        # Store sanitized token back into environment for downstream use
+        os.environ["LINEAJE_PAT_TOKEN"] = pat_token
+
+    except ValueError as exc:
+        logger.error("Input validation error: %s", exc)
+        err = {"status": "error", "scan_errors": [f"Input validation error: {exc}"]}
+        print(json.dumps(err, indent=2))
+        return 2
+
+    # Validate --mcp-server-url against the allowlist before any network I/O.
+    mcp_url = args.mcp_server_url or MCP_SERVER_URL
+    if mcp_url:
+        try:
+            _validate_url_allowlist(mcp_url, _ALLOWED_MCP_HOSTNAMES, "--mcp-server-url")
+        except ValueError as exc:
+            logger.error("MCP server URL rejected by allowlist: %s", exc)
+            err = {"status": "error", "scan_errors": [str(exc)]}
+            print(json.dumps(err, indent=2))
+            return 1
+
     try:
         return _execute_scan(args)
     except Exception:
         logger.exception("Unhandled error")
         err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
         print(json.dumps(err, indent=2))
+        # Attempt to write an audit record for the unhandled failure.
+        # fail_closed=True means if the audit sink is unreachable we do NOT
+        # silently swallow the problem — we log it loudly and still exit non-zero.
+        try:
+            _write_audit_record({
+                "event": "scan_unhandled_error",
+                "trace_id": locals().get("trace_id", "unknown"),
+                "run_id": locals().get("run_id", "unknown"),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "principal": locals().get("principal", os.environ.get("GITHUB_ACTOR", "unknown")),
+                "model": MODEL_IDENTIFIER,
+                "output_hash": _sha256_of(err),
+                "retention_days": AUDIT_LOG_RETENTION_DAYS,
+            }, fail_closed=True)
+        except RuntimeError as audit_exc:
+            # Audit sink is unreachable — alert loudly and fail closed.
+            logger.critical(
+                "AUDIT SINK UNREACHABLE during unhandled error recovery: %s — "
+                "failing closed to preserve forensic integrity.",
+                audit_exc,
+            )
+            sys.stderr.write(
+                f"CRITICAL: audit sink unreachable: {audit_exc}\n"
+            )
+            sys.stderr.flush()
+            return 3  # Distinct exit code: audit failure
         return 1
 
 
