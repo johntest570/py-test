@@ -42,6 +42,7 @@ Exit codes::
 from __future__ import annotations
 
 import argparse
+import datetime
 import asyncio
 import base64
 import fnmatch
@@ -54,11 +55,12 @@ import sys
 import tempfile
 import threading
 import time
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -70,11 +72,410 @@ logger = logging.getLogger("gha_repo_scan")
 
 MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
+# SSL context that enforces server certificate validation for MCP connections
+_MCP_SSL_CONTEXT = ssl.create_default_context()
+_MCP_SSL_CONTEXT.verify_mode = ssl.CERT_REQUIRED
+_MCP_SSL_CONTEXT.check_hostname = True
+
+# ===========================================================================
+# Prompt-injection / malicious-content guard
+# ===========================================================================
+
+# Invisible / zero-width Unicode characters commonly used to hide instructions
+_INVISIBLE_CHARS_RE = re.compile(
+    r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u2028\u2029]"
+)
+
+# Patterns that look like shell commands or script directives embedded in text
+_SHELL_COMMAND_RE = re.compile(
+    r"(?m)(?:^|\s)(?:sudo|chmod|chown|curl|wget|bash|sh|zsh|python|perl|ruby|nc|ncat|netcat|eval|exec)\s",
+    re.IGNORECASE,
+)
+
+# Patterns that look like prompt-injection meta-instructions
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?i)(?:"
+    r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions"
+    r"|disregard\s+(?:all\s+)?(?:previous|prior|above)\s+instructions"
+    r"|you\s+are\s+now\s+(?:a\s+)?(?:an?\s+)?(?:different|new|another|evil|malicious)"
+    r"|act\s+as\s+(?:a\s+)?(?:an?\s+)?(?:different|new|another|evil|malicious|unrestricted)"
+    r"|system\s*:\s*you\s+are"
+    r"|<\s*system\s*>"
+    r")"
+)
+
+# Leetspeak: digits substituted for letters in suspicious keywords
+_LEETSPEAK_RE = re.compile(
+    r"(?i)(?:[i1][g9][n][o0][r3][e3]|[e3][x][e3][c]|[s5][h][e3][l1][l1])"
+)
+
+# Suspiciously long base64-looking blobs (>= 64 contiguous base64 chars)
+_BASE64_BLOB_RE = re.compile(
+    r"(?:[A-Za-z0-9+/]{64,}={0,2})"
+)
+
+# Null bytes / non-printable binary content
+_BINARY_CONTENT_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_file_content_for_prompt(path: str, content: str) -> str:
+    """Return a safe version of *content* for inclusion in an AI prompt.
+
+    Checks for several categories of potentially malicious content that could
+    be used for prompt injection or to execute commands at runtime:
+
+    * Hidden / invisible Unicode characters
+    * Null bytes and non-printable binary sequences
+    * Embedded shell commands
+    * Prompt-injection meta-instructions
+    * Leetspeak obfuscation of dangerous keywords
+    * Suspiciously long base64-encoded blobs
+
+    If any indicator is found the file content is replaced with a safe
+    placeholder so that the AI agent never sees the raw payload.
+    """
+    reasons: list[str] = []
+
+    if _INVISIBLE_CHARS_RE.search(content):
+        reasons.append("hidden/invisible Unicode characters")
+
+    if _BINARY_CONTENT_RE.search(content):
+        reasons.append("binary/non-printable bytes")
+
+    if _SHELL_COMMAND_RE.search(content):
+        reasons.append("embedded shell command")
+
+    if _PROMPT_INJECTION_RE.search(content):
+        reasons.append("prompt-injection instruction")
+
+    if _LEETSPEAK_RE.search(content):
+        reasons.append("leetspeak obfuscation")
+
+    # Only flag base64 blobs that are NOT in known binary-safe file types
+    _safe_b64_extensions = {".pem", ".crt", ".cer", ".der", ".p12", ".pfx"}
+    ext = pathlib.Path(path).suffix.lower()
+    if ext not in _safe_b64_extensions and _BASE64_BLOB_RE.search(content):
+        # Attempt to decode and check for shell/binary payload
+        for match in _BASE64_BLOB_RE.finditer(content):
+            try:
+                decoded = base64.b64decode(match.group(0) + "==").decode("utf-8", errors="replace")
+                if _SHELL_COMMAND_RE.search(decoded) or _PROMPT_INJECTION_RE.search(decoded):
+                    reasons.append("base64-encoded malicious payload")
+                    break
+            except Exception:
+                pass
+
+    if reasons:
+        logger.warning(
+            "[prompt-injection guard] Blocked file '%s' from prompt — detected: %s",
+            path,
+            ", ".join(reasons),
+        )
+        return (
+            f"# [SECURITY] Content of '{path}' was redacted by the prompt-injection "
+            f"guard ({', '.join(reasons)}) and is not available for review."
+        )
+
+    return content
+
+# ===========================================================================
+# Input sanitization for MCP / AI model submissions
+# ===========================================================================
+
+_MAX_FILE_CONTENT_BYTES = 512_000  # 512 KB per file
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?im)"
+    r"(^\s*(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)[^\n]*)"
+    r"|(^\s*system\s*:\s*)"
+    r"|(^\s*<\s*/?\s*(system|instruction|prompt)\s*>)"
+    r"|(\\x[0-9a-fA-F]{2})"
+)
+
+
+def sanitize_file_content(content: str, path: str = "") -> str:
+    """Sanitize file content before sending to the MCP/AI model endpoint.
+
+    Steps:
+    1. Ensure the value is a plain string (reject non-string types).
+    2. Enforce a maximum byte length to prevent oversized payloads.
+    3. Remove null bytes and non-printable ASCII control characters
+       (except common whitespace: tab, newline, carriage-return).
+    4. Redact lines that match known prompt-injection patterns so that
+       malicious repository content cannot hijack the AI model.
+    """
+    if not isinstance(content, str):
+        logger.warning("sanitize_file_content: non-string content for %s; coercing", path)
+        try:
+            content = str(content)
+        except Exception:
+            return ""
+
+    # Enforce byte-length limit (truncate, not reject, to preserve partial analysis)
+    encoded = content.encode("utf-8", errors="replace")
+    if len(encoded) > _MAX_FILE_CONTENT_BYTES:
+        logger.warning(
+            "sanitize_file_content: truncating %s from %d to %d bytes",
+            path, len(encoded), _MAX_FILE_CONTENT_BYTES,
+        )
+        content = encoded[:_MAX_FILE_CONTENT_BYTES].decode("utf-8", errors="replace")
+
+    # Remove null bytes and dangerous control characters
+    # Keep: \t (0x09), \n (0x0A), \r (0x0D)
+    content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", content)
+
+    # Redact prompt-injection patterns line-by-line
+    sanitized_lines: list[str] = []
+    for line in content.splitlines(keepends=True):
+        if _PROMPT_INJECTION_RE.search(line):
+            logger.warning(
+                "sanitize_file_content: redacted potential prompt-injection line in %s", path
+            )
+            # Replace the offending line with a neutral placeholder
+            sanitized_lines.append("[REDACTED]\n")
+        else:
+            sanitized_lines.append(line)
+    return "".join(sanitized_lines)
+
+# Patterns that indicate dynamic code execution primitives in LLM output
+_DANGEROUS_CODE_EXECUTION_PATTERNS = re.compile(
+    r'\b(eval|exec|execfile|compile|__import__|importlib\.import_module'
+    r'|subprocess\.(?:call|run|Popen|check_output|check_call|getoutput|getstatusoutput)'
+    r'|os\.(?:system|popen|execv|execve|execvp|execvpe|spawnl|spawnle|spawnlp|spawnlpe'
+    r'|spawnv|spawnve|spawnvp|spawnvpe)'
+    r'|ctypes\.(?:CDLL|WinDLL|OleDLL|PyDLL|cdll|windll|oledll)'
+    r'|pickle\.(?:loads|load|Unpickler)'
+    r'|marshal\.(?:loads|load)'
+    r'|runpy\.(?:run_module|run_path)'
+    r'|code\.(?:InteractiveConsole|InteractiveInterpreter|compile_command)'
+    r'|builtins\.(?:eval|exec|compile)'
+    r')\s*\(',
+    re.IGNORECASE,
+)
+
+
+def validate_llm_output(response: Any, source: str = "LLM") -> Any:
+    """Validate and sanitize output from an LLM/MCP service.
+
+    Checks for the presence of dynamic code execution primitives (eval, exec,
+    subprocess calls, etc.) in LLM-generated text responses. Raises a
+    ValueError if dangerous patterns are detected.
+
+    Args:
+        response: The raw response object from the LLM/MCP service.
+        source: A label identifying the source (for logging purposes).
+
+    Returns:
+        The validated response if no dangerous patterns are found.
+
+    Raises:
+        ValueError: If dangerous dynamic code execution primitives are detected.
+    """
+    if response is None:
+        return response
+
+    # Collect all string content from the response for inspection
+    text_to_check: list[str] = []
+
+    if isinstance(response, str):
+        text_to_check.append(response)
+    elif isinstance(response, dict):
+        # Recursively extract string values from dict responses
+        def _extract_strings(obj: Any) -> None:
+            if isinstance(obj, str):
+                text_to_check.append(obj)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _extract_strings(v)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    _extract_strings(item)
+        _extract_strings(response)
+    elif isinstance(response, (list, tuple)):
+        def _extract_strings_seq(obj: Any) -> None:
+            if isinstance(obj, str):
+                text_to_check.append(obj)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _extract_strings_seq(v)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    _extract_strings_seq(item)
+        _extract_strings_seq(response)
+
+    # Check each extracted string for dangerous patterns
+    for text in text_to_check:
+        match = _DANGEROUS_CODE_EXECUTION_PATTERNS.search(text)
+        if match:
+            logger.error(
+                "[LLM Output Validation] Dangerous code execution primitive '%s' "
+                "detected in %s response. Rejecting output.",
+                match.group(0),
+                source,
+            )
+            raise ValueError(
+                f"LLM output from '{source}' contains a forbidden dynamic code "
+                f"execution primitive: '{match.group(0)}'. Output rejected for security."
+            )
+
+    logger.debug(
+        "[LLM Output Validation] %s response passed validation (%d text segments checked).",
+        source,
+        len(text_to_check),
+    )
+    return response
+
+# ---------------------------------------------------------------------------
+# MCP server output validation / sanitisation
+# ---------------------------------------------------------------------------
+
+_MCP_MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB hard cap
+_MCP_MAX_STRING_LENGTH = 1_000_000          # per-field string cap
+_MCP_ALLOWED_TOP_LEVEL_KEYS = frozenset({   # expected envelope keys
+    "result", "error", "id", "jsonrpc", "method", "params",
+    "content", "violations", "aibom", "report", "status",
+    "scan_metadata", "scan_errors",
+})
+# Regex that matches ASCII control characters (except tab/newline/CR)
+_MCP_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_mcp_string(value: str) -> str:
+    """Strip dangerous control characters and truncate overly long strings."""
+    value = _MCP_CTRL_CHAR_RE.sub("", value)
+    if len(value) > _MCP_MAX_STRING_LENGTH:
+        value = value[:_MCP_MAX_STRING_LENGTH]
+        logger.warning(
+            "MCP response field truncated to %d characters", _MCP_MAX_STRING_LENGTH
+        )
+    return value
+
+
+def _sanitize_mcp_value(value: Any, _depth: int = 0) -> Any:
+    """Recursively sanitise a value returned by the MCP server."""
+    if _depth > 20:
+        # Prevent stack overflow from pathologically nested structures
+        raise ValueError("MCP response nesting depth exceeds limit (20)")
+    if isinstance(value, str):
+        return _sanitize_mcp_string(value)
+    if isinstance(value, dict):
+        return {
+            _sanitize_mcp_string(str(k)): _sanitize_mcp_value(v, _depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_mcp_value(item, _depth + 1) for item in value]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    # Coerce unexpected scalar types to string and sanitise
+    return _sanitize_mcp_string(str(value))
+
+
+def validate_and_sanitize_mcp_response(raw: Any) -> Any:
+    """Validate and sanitise output received from the MCP server.
+
+    Raises ``ValueError`` if the response fails structural validation.
+    Returns a sanitised copy of the response on success.
+    """
+    # 1. Type check — top-level must be a dict
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"MCP response must be a JSON object (dict), got {type(raw).__name__!r}"
+        )
+
+    # 2. Size guard — serialise to measure byte footprint
+    try:
+        serialised = json.dumps(raw, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"MCP response is not JSON-serialisable: {exc}") from exc
+    if len(serialised.encode("utf-8")) > _MCP_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"MCP response exceeds maximum allowed size "
+            f"({_MCP_MAX_RESPONSE_BYTES // (1024 * 1024)} MB)"
+        )
+
+    # 3. Warn on unexpected top-level keys (do not reject — server may add fields)
+    unexpected = set(raw.keys()) - _MCP_ALLOWED_TOP_LEVEL_KEYS
+    if unexpected:
+        logger.warning(
+            "MCP response contains unexpected top-level keys: %s",
+            ", ".join(sorted(unexpected)),
+        )
+
+    # 4. Recursively sanitise all string content
+    sanitised: Any = _sanitize_mcp_value(raw)
+    return sanitised
+
+
+def _mcp_request(
+    url: str,
+    method: str = "POST",
+    payload: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 60,
+) -> Tuple[int, Any]:
+    """Send a request to the MCP server and log the interaction.
+
+    All requests to and responses from the MCP server are logged at INFO
+    level so that every interaction is auditable.
+
+    Args:
+        url: The MCP server endpoint URL.
+        method: HTTP method (default ``POST``).
+        payload: JSON-serialisable request body (optional).
+        headers: Additional HTTP headers (optional).
+        timeout: Socket timeout in seconds.
+
+    Returns:
+        A ``(status_code, response_body)`` tuple where *response_body* is
+        the parsed JSON object returned by the server, or the raw response
+        text when the body is not valid JSON.
+    """
+    headers = dict(headers or {})
+    headers.setdefault("Content-Type", "application/json")
+
+    body_bytes = json.dumps(payload).encode() if payload is not None else b""
+
+    logger.info(
+        "MCP request  | method=%s url=%s payload=%s",
+        method,
+        url,
+        json.dumps(payload) if payload is not None else "<none>",
+    )
+
+    req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            status_code: int = resp.status
+            raw_body: str = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        raw_body = exc.read().decode("utf-8", errors="replace")
+
+    try:
+        response_body: Any = json.loads(raw_body)
+    except json.JSONDecodeError:
+        response_body = raw_body
+
+    logger.info(
+        "MCP response | status=%s url=%s body=%s",
+        status_code,
+        url,
+        json.dumps(response_body) if not isinstance(response_body, str) else response_body,
+    )
+
+    return status_code, response_body
+
 MAX_SCAN_WORKERS = 4
+SCAN_FUTURE_TIMEOUT_SEC = 300  # Maximum seconds to wait for any single worker future
+MAX_SCAN_BATCHES = 500         # Maximum number of batches that may be spawned per scan run
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
+# Hard maximum lifetime cap: tokens are never trusted beyond this many seconds
+# regardless of what the server returns, providing a server-side-independent
+# invalidation boundary enforced on every use by _verify_and_extract_token.
+_TOKEN_HARD_MAX_LIFETIME_SEC = 3600
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
     "https://lineaje-identity-service.v2.prod.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
@@ -1059,6 +1460,63 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv or sys.argv[1:])
 
 
+# ---------------------------------------------------------------------------
+# Audit helpers
+# ---------------------------------------------------------------------------
+AUDIT_LOG_PATH = os.environ.get("SCAN_AUDIT_LOG", "scan_audit.log")
+_AUDIT_MODEL_ID = "lineaje-ai-policy-scanner/v1"
+
+
+def _audit_record(
+    event: str,
+    args_ns: argparse.Namespace,
+    *,
+    outcome: Optional[str] = None,
+    exit_code: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Append a single JSON-lines audit record to AUDIT_LOG_PATH."""
+    import hashlib, getpass, json as _json
+
+    # Stable, order-independent hash of the scan inputs
+    input_repr = _json.dumps(
+        {
+            "source_path": getattr(args_ns, "source_path", ""),
+            "repo": getattr(args_ns, "repo", ""),
+            "branch": getattr(args_ns, "branch", ""),
+            "head_sha": getattr(args_ns, "head_sha", ""),
+            "mcp_server_url": getattr(args_ns, "mcp_server_url", ""),
+            "create_fix_pr": getattr(args_ns, "create_fix_pr", False),
+        },
+        sort_keys=True,
+    )
+    input_hash = hashlib.sha256(input_repr.encode()).hexdigest()
+
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "event": event,
+        "model_id": _AUDIT_MODEL_ID,
+        "principal": (
+            os.environ.get("GITHUB_ACTOR")
+            or os.environ.get("USER")
+            or getpass.getuser()
+        ),
+        "runner": os.environ.get("RUNNER_NAME", ""),
+        "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+        "input_hash": input_hash,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "error": error,
+    }
+
+    try:
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(record) + "\n")
+    except OSError as exc:
+        logger.warning("audit-log write failed: %s", exc)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -1071,10 +1529,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Always show INFO from this logger regardless of --debug
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
+    # --- Audit: record scan invocation before any AI-driven action ---
+    _audit_record("scan_started", args)
+
     try:
-        return _execute_scan(args)
-    except Exception:
+        exit_code = _execute_scan(args)
+        # --- Audit: record successful completion with outcome ---
+        _audit_record(
+            "scan_completed",
+            args,
+            outcome="success",
+            exit_code=exit_code,
+        )
+        return exit_code
+    except Exception as exc:
         logger.exception("Unhandled error")
+        # --- Audit: record error so it is never silently swallowed ---
+        _audit_record(
+            "scan_error",
+            args,
+            outcome="error",
+            exit_code=1,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
         print_human_output(err)
         return 1
