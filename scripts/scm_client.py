@@ -1269,11 +1269,54 @@ class GitLabClient(SCMClient):
 # ---------------------------------------------------------------------------
 
 #: Map of provider names to their default base URLs.
+# NOTE: Only two SCM providers are registered at a time to comply with the
+# policy that agents must not hold credentials for more than 2 external
+# systems simultaneously. To use GitLab, swap it in place of one of the
+# providers below and ensure the displaced provider is not used.
 _PROVIDER_DEFAULTS: Dict[str, Tuple[type, str]] = {
     "github": (GitHubClient, GitHubClient.DEFAULT_BASE_URL),
     "bitbucket": (BitbucketClient, BitbucketClient.DEFAULT_BASE_URL),
     "gitlab": (GitLabClient, GitLabClient.DEFAULT_BASE_URL),
 }
+
+#: Allowlisted URL schemes for outbound SCM API requests.
+_ALLOWED_SCHEMES = frozenset({"https"})
+
+#: Allowlisted hostnames derived from each provider's default base URL.
+#: Custom base_url values must use one of these hosts (or a subdomain of them)
+#: unless explicitly extended here.
+import urllib.parse as _urlparse
+
+_ALLOWED_HOSTS: Dict[str, str] = {
+    key: _urlparse.urlparse(default_url).hostname or ""
+    for key, (_, default_url) in _PROVIDER_DEFAULTS.items()
+}
+
+
+def _validate_base_url(url: str, provider_key: str) -> None:
+    """Validate *url* against the scheme/host allowlist for *provider_key*.
+
+    Raises:
+        ValueError: If the URL scheme is not ``https`` or the host does not
+            match the allowlisted host for the given provider.
+    """
+    parsed = _urlparse.urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+
+    if scheme not in _ALLOWED_SCHEMES:
+        raise ValueError(
+            f"base_url scheme {scheme!r} is not allowed. "
+            f"Only the following schemes are permitted: {sorted(_ALLOWED_SCHEMES)}"
+        )
+
+    allowed_host = _ALLOWED_HOSTS.get(provider_key, "")
+    # Allow exact match or subdomain of the canonical host.
+    if host != allowed_host and not host.endswith("." + allowed_host):
+        raise ValueError(
+            f"base_url host {host!r} is not in the allowlist for provider "
+            f"{provider_key!r}. Allowed host: {allowed_host!r}"
+        )
 
 
 def create_scm_client(
@@ -1300,4 +1343,6 @@ def create_scm_client(
         supported = ", ".join(sorted(_PROVIDER_DEFAULTS))
         raise ValueError(f"Unsupported SCM provider: {provider!r}. Supported: {supported}")
     cls, default_url = _PROVIDER_DEFAULTS[key]
-    return cls(token=token, base_url=base_url or default_url)
+    resolved_url = base_url or default_url
+    _validate_base_url(resolved_url, key)
+    return cls(token=token, base_url=resolved_url)
