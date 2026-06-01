@@ -59,6 +59,22 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _validate_mcp_response(data: dict) -> dict:
+    """Validate and sanitize MCP server response structure"""
+    if not isinstance(data, dict):
+        raise ValueError("Invalid MCP response: expected dictionary")
+    
+    # Basic sanitization of string values
+    sanitized = {}
+    for k, v in data.items():
+        if isinstance(v, str):
+            # Remove potentially dangerous characters
+            sanitized[k] = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', v)
+        else:
+            sanitized[k] = v
+    return sanitized
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
