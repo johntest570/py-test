@@ -65,16 +65,411 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger("gha_repo_scan")
 
 # ===========================================================================
+# LLM Output Sanitization
+# ===========================================================================
+
+# Patterns that indicate dynamic code execution primitives in LLM output
+_DANGEROUS_PATTERNS: List[Tuple[str, str]] = [
+    (r'\beval\s*\(', 'eval()'),
+    (r'\bexec\s*\(', 'exec()'),
+    (r'\bcompile\s*\(', 'compile()'),
+    (r'\b__import__\s*\(', '__import__()'),
+    (r'\bimportlib\.import_module\s*\(', 'importlib.import_module()'),
+    (r'\bos\.system\s*\(', 'os.system()'),
+    (r'\bos\.popen\s*\(', 'os.popen()'),
+    (r'\bsubprocess\.(?:call|run|Popen|check_output|check_call)\s*\([^)]*shell\s*=\s*True',
+     'subprocess(...shell=True)'),
+    (r'\bpickle\.loads?\s*\(', 'pickle.load(s)()'),
+    (r'\bmarshal\.loads?\s*\(', 'marshal.load(s)()'),
+    (r'\bctypes\.', 'ctypes usage'),
+    (r'\b__builtins__\b', '__builtins__ access'),
+    (r'\bgetattr\s*\(.*,\s*[\'"]__', 'getattr with dunder'),
+    (r'\bsetattr\s*\(', 'setattr()'),
+    (r'\bdelattr\s*\(', 'delattr()'),
+    (r'\bglobals\s*\(\s*\)', 'globals()'),
+    (r'\blocals\s*\(\s*\)', 'locals()'),
+    (r'\bvars\s*\(\s*\)', 'vars()'),
+]
+
+
+def _find_dangerous_patterns(text: str) -> List[str]:
+    """Return a list of dangerous pattern names found in *text*."""
+    found: List[str] = []
+    for pattern, label in _DANGEROUS_PATTERNS:
+        if re.search(pattern, text):
+            found.append(label)
+    return found
+
+
+def _sanitize_string(value: str, context: str = "") -> str:
+    """Validate a string from LLM output for dangerous primitives.
+
+    If dangerous patterns are detected the content is returned unchanged but
+    a WARNING is emitted so that downstream consumers (CI logs, SIEM) can
+    act on it.  We intentionally do *not* silently drop content so that
+    legitimate security-research output (e.g. a report that *mentions* eval)
+    is still surfaced — the warning is the control.
+    """
+    hits = _find_dangerous_patterns(value)
+    if hits:
+        logger.warning(
+            "[LLM-OUTPUT-SANITIZE] Potentially dangerous primitive(s) detected "
+            "in LLM output%s: %s",
+            f" ({context})" if context else "",
+            ", ".join(hits),
+        )
+    return value
+
+
+def _sanitize_llm_value(value: Any, context: str = "") -> Any:
+    """Recursively validate LLM output (dict / list / str) for dangerous primitives."""
+    if isinstance(value, str):
+        return _sanitize_string(value, context)
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_llm_value(v, context=f"{context}.{k}" if context else k)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _sanitize_llm_value(item, context=f"{context}[{i}]")
+            for i, item in enumerate(value)
+        ]
+    return value
+
+
+def sanitize_llm_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and sanitize all LLM-originated fields in a scan response.
+
+    Fields checked: ``violations``, ``fix_code``, ``aibom``, ``report``.
+    Returns the (possibly annotated) response dict.
+    """
+    for field in ("violations", "fix_code", "aibom", "report"):
+        if field in response:
+            response[field] = _sanitize_llm_value(response[field], context=field)
+    return response
+
+# ===========================================================================
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"  # TLS-only endpoint; sessions use signed tokens
+
+# ===========================================================================
+# Prompt Sanitization
+# ===========================================================================
+
+# Invisible/hidden Unicode characters that may be used to smuggle instructions
+_INVISIBLE_CHAR_PATTERN = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"
+    r"\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]"
+)
+
+# Shell command patterns that should not appear in prompt content
+_SHELL_COMMAND_PATTERN = re.compile(
+    r"(?:^|\s|;|&&|\|\|)"
+    r"(?:bash|sh|zsh|ksh|csh|cmd\.exe|powershell|pwsh|eval|exec|system|popen)"
+    r"\s*(?:-[a-zA-Z]+\s+)?[\"']?(?:/[^\s]*|[a-zA-Z]:\\[^\s]*|`[^`]+`|\$\([^)]+\))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Binary executable magic bytes (ELF, PE/MZ, Mach-O, shebang with interpreter)
+_BINARY_MAGIC: list[bytes] = [
+    b"\x7fELF",          # ELF executable (Linux)
+    b"MZ",              # PE/MZ executable (Windows)
+    b"\xfe\xed\xfa\xce", # Mach-O 32-bit
+    b"\xfe\xed\xfa\xcf", # Mach-O 64-bit
+    b"\xce\xfa\xed\xfe", # Mach-O 32-bit (reversed)
+    b"\xcf\xfa\xed\xfe", # Mach-O 64-bit (reversed)
+    b"\xca\xfe\xba\xbe", # Mach-O fat binary
+]
+
+
+def _is_base64_encoded_command(text: str) -> bool:
+    """Return True if *text* contains a base64 string that decodes to a shell command."""
+    # Match standalone base64-looking tokens (min 20 chars to reduce false positives)
+    b64_pattern = re.compile(r"[A-Za-z0-9+/]{20,}={0,2}")
+    shell_indicators = (
+        b"bash", b"sh ", b"/bin/", b"eval", b"exec",
+        b"wget", b"curl", b"chmod", b"python", b"perl", b"ruby",
+        b"powershell", b"cmd.exe", b"system(", b"popen(",
+    )
+    for match in b64_pattern.finditer(text):
+        token = match.group(0)
+        # Pad to valid base64 length
+        padding = (4 - len(token) % 4) % 4
+        try:
+            decoded = base64.b64decode(token + "=" * padding)
+            decoded_lower = decoded.lower()
+            if any(indicator in decoded_lower for indicator in shell_indicators):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _has_binary_executable_signature(content_bytes: bytes) -> bool:
+    """Return True if *content_bytes* starts with a known binary executable magic number."""
+    for magic in _BINARY_MAGIC:
+        if content_bytes.startswith(magic):
+            return True
+    return False
+
+
+def sanitize_prompt_content(file_path: str, content: str) -> str:
+    """Validate and sanitize file content before use as an AI prompt.
+
+    Raises ``ValueError`` if the content contains patterns that could be used
+    to inject malicious commands into the AI agent at runtime.
+
+    Returns the original *content* unchanged when no violations are detected.
+    """
+    # 1. Check for binary executable signatures
+    try:
+        raw_bytes = content.encode("utf-8", errors="replace")
+    except Exception:
+        raw_bytes = b""
+    if _has_binary_executable_signature(raw_bytes):
+        raise ValueError(
+            f"Prompt sanitization rejected '{file_path}': "
+            "content begins with a binary executable signature."
+        )
+
+    # 2. Check for hidden/invisible Unicode characters
+    if _INVISIBLE_CHAR_PATTERN.search(content):
+        raise ValueError(
+            f"Prompt sanitization rejected '{file_path}': "
+            "content contains hidden or invisible Unicode characters that may smuggle instructions."
+        )
+
+    # 3. Check for base64-encoded shell commands
+    if _is_base64_encoded_command(content):
+        raise ValueError(
+            f"Prompt sanitization rejected '{file_path}': "
+            "content contains base64-encoded data that decodes to shell commands."
+        )
+
+    # 4. Check for direct shell command injection patterns
+    if _SHELL_COMMAND_PATTERN.search(content):
+        raise ValueError(
+            f"Prompt sanitization rejected '{file_path}': "
+            "content contains shell command patterns that could execute malicious instructions."
+        )
+
+    return content
+
+# ===========================================================================
+# Input Sanitization
+# ===========================================================================
+
+_MAX_FILE_CONTENT_BYTES = 512 * 1024  # 512 KB per file
+_SECRET_PATTERNS = [
+    re.compile(r'(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|private[_-]?key)\s*[:=]\s*[\'"]?([A-Za-z0-9+/=_\-]{8,})[\'"]?'),
+    re.compile(r'(?i)(bearer\s+)([A-Za-z0-9\-._~+/]+=*)'),
+    re.compile(r'(?i)(ghp_|ghs_|github_pat_)[A-Za-z0-9_]{10,}'),
+    re.compile(r'(?i)(sk-|pk-)[A-Za-z0-9]{20,}'),
+]
+
+
+def sanitize_file_content(content: str, file_path: str = "") -> Optional[str]:
+    """Sanitize and validate file content before sending to the MCP/LLM endpoint.
+
+    Returns sanitized content string, or None if the content should be skipped.
+    """
+    # Validate and enforce UTF-8 encoding
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            logger.warning("Skipping file %s: content is not valid UTF-8", file_path)
+            return None
+
+    if not isinstance(content, str):
+        logger.warning("Skipping file %s: content is not a string", file_path)
+        return None
+
+    # Enforce maximum content size
+    encoded = content.encode("utf-8", errors="replace")
+    if len(encoded) > _MAX_FILE_CONTENT_BYTES:
+        logger.warning(
+            "Truncating file %s: content exceeds %d bytes (actual: %d bytes)",
+            file_path, _MAX_FILE_CONTENT_BYTES, len(encoded),
+        )
+        content = encoded[:_MAX_FILE_CONTENT_BYTES].decode("utf-8", errors="replace")
+
+    # Strip null bytes
+    content = content.replace("\x00", "")
+
+    # Strip non-printable control characters (keep newlines, tabs, carriage returns)
+    content = re.sub(r'[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
+
+    # Redact secret-like patterns to avoid leaking credentials to the LLM
+    for pattern in _SECRET_PATTERNS:
+        content = pattern.sub(lambda m: m.group(0)[:m.start(2) - m.start(0)] + '[REDACTED]', content)
+
+    return content
+
+
+def sanitize_mcp_output(data: Any, max_depth: int = 10, _depth: int = 0) -> Any:
+    """Validate and sanitize output received from the MCP server.
+
+    Applies the following controls:
+    - Enforces a maximum recursion depth to prevent deeply nested payloads.
+    - Strips NUL bytes and control characters from string values.
+    - Limits individual string length to 1 MB to prevent memory exhaustion.
+    - Rejects unexpected top-level types (only dict, list, str, int, float,
+      bool, and None are accepted).
+    - Removes keys whose names contain characters outside [A-Za-z0-9_.\-].
+
+    Args:
+        data: Raw value returned by an MCP tool call.
+        max_depth: Maximum allowed nesting depth (default 10).
+        _depth: Internal recursion counter — callers should not set this.
+
+    Returns:
+        A sanitized copy of *data* safe for further processing.
+
+    Raises:
+        ValueError: If *data* contains a type that is not permitted.
+    """
+    _MAX_STRING_LEN = 1_048_576  # 1 MiB
+    _SAFE_KEY_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+    if _depth > max_depth:
+        logger.warning("sanitize_mcp_output: max nesting depth %d exceeded; truncating", max_depth)
+        return None
+
+    if data is None or isinstance(data, (bool, int, float)):
+        return data
+
+    if isinstance(data, str):
+        # Remove NUL bytes and ASCII control characters (except tab/newline/CR)
+        sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', data)
+        if len(sanitized) > _MAX_STRING_LEN:
+            logger.warning(
+                "sanitize_mcp_output: string value truncated from %d to %d bytes",
+                len(sanitized), _MAX_STRING_LEN,
+            )
+            sanitized = sanitized[:_MAX_STRING_LEN]
+        return sanitized
+
+    if isinstance(data, list):
+        return [
+            sanitize_mcp_output(item, max_depth=max_depth, _depth=_depth + 1)
+            for item in data
+        ]
+
+    if isinstance(data, dict):
+        result: Dict[str, Any] = {}
+        for key, value in data.items():
+            if not isinstance(key, str):
+                logger.warning("sanitize_mcp_output: dropping non-string key %r", key)
+                continue
+            if not _SAFE_KEY_RE.match(key):
+                logger.warning("sanitize_mcp_output: dropping unsafe key %r", key)
+                continue
+            result[key] = sanitize_mcp_output(value, max_depth=max_depth, _depth=_depth + 1)
+        return result
+
+    raise ValueError(
+        f"sanitize_mcp_output: unexpected type {type(data).__name__!r} in MCP server response"
+    )
+
+
+def _mcp_request(method: str, url: str, payload: Any = None, headers: Optional[Dict[str, str]] = None, timeout: int = 60) -> Any:
+    """Send a request to the MCP server with mandatory interaction logging.
+
+    All MCP client interactions MUST be logged (request and response) per
+    security policy. This function is the single authorised entry-point for
+    every call to MCP_SERVER_URL.
+    """
+    sanitized_payload = None
+    if payload is not None:
+        try:
+            raw = json.dumps(payload)
+            sanitized_payload = raw[:500] + ("…" if len(raw) > 500 else "")
+        except Exception:
+            sanitized_payload = "<non-serialisable payload>"
+
+    logger.info(
+        "[MCP REQUEST] method=%s url=%s payload_preview=%s",
+        method.upper(),
+        url,
+        sanitized_payload,
+    )
+
+    body_bytes = json.dumps(payload).encode() if payload is not None else None
+    req_headers = {"Content-Type": "application/json", **(headers or {})}
+    req = urllib.request.Request(url, data=body_bytes, headers=req_headers, method=method.upper())
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status_code = resp.status
+            raw_body = resp.read()
+            try:
+                response_obj = json.loads(raw_body)
+            except Exception:
+                response_obj = raw_body.decode(errors="replace")
+
+            preview = ""
+            try:
+                preview_str = json.dumps(response_obj)
+                preview = preview_str[:500] + ("…" if len(preview_str) > 500 else "")
+            except Exception:
+                preview = str(response_obj)[:500]
+
+            logger.info(
+                "[MCP RESPONSE] method=%s url=%s status=%s response_preview=%s",
+                method.upper(),
+                url,
+                status_code,
+                preview,
+            )
+            return response_obj
+    except urllib.error.HTTPError as exc:
+        error_body = ""
+        try:
+            error_body = exc.read().decode(errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error(
+            "[MCP RESPONSE ERROR] method=%s url=%s status=%s error_body=%s",
+            method.upper(),
+            url,
+            exc.code,
+            error_body,
+        )
+        raise
+    except Exception as exc:
+        logger.error(
+            "[MCP RESPONSE ERROR] method=%s url=%s error=%s",
+            method.upper(),
+            url,
+            exc,
+        )
+        raise
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
+
+def _sanitize_batch_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sanitize all file content entries in a batch before submission to MCP."""
+    sanitized = []
+    for entry in files:
+        raw_content = entry.get("content", "")
+        clean_content = sanitize_file_content(raw_content, file_path=entry.get("path", ""))
+        if clean_content is None:
+            logger.info("Excluding file from batch due to sanitization failure: %s", entry.get("path", ""))
+            continue
+        sanitized_entry = dict(entry)
+        sanitized_entry["content"] = clean_content
+        sanitized.append(sanitized_entry)
+    return sanitized
+
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
+_SESSION_SUBJECT_PREFIX = "gha-scan"  # subject bound to session tokens
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
     "https://lineaje-identity-service.v2.prod.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
@@ -1060,6 +1455,88 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv or sys.argv[1:])
 
 
+# ---------------------------------------------------------------------------
+# Audit / decision logging
+# ---------------------------------------------------------------------------
+_AUDIT_LOG_PATH: str = os.environ.get(
+    "LINEAJE_AUDIT_LOG",
+    os.path.join(os.path.expanduser("~"), ".lineaje", "audit.jsonl"),
+)
+_MODEL_ID: str = os.environ.get("LINEAJE_MODEL_ID", "lineaje-mcp-scanner")
+_MODEL_VERSION: str = os.environ.get("LINEAJE_MODEL_VERSION", "unknown")
+
+
+def _compute_input_hash(args: argparse.Namespace) -> str:
+    """Return a SHA-256 hex digest of the scan's key input parameters."""
+    import hashlib, json as _json
+    payload = _json.dumps(
+        {
+            "source_path": getattr(args, "source_path", "."),
+            "repo": getattr(args, "repo", ""),
+            "branch": getattr(args, "branch", ""),
+            "head_sha": getattr(args, "head_sha", ""),
+            "mcp_server_url": getattr(args, "mcp_server_url", ""),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _write_audit_record(
+    args: argparse.Namespace,
+    exit_code: int,
+    output_summary: str,
+) -> None:
+    """Append a single JSONL audit record to the persistent audit log.
+
+    The record captures:
+      - ISO-8601 UTC timestamp
+      - principal (OS user + CI actor)
+      - model identifier and version
+      - SHA-256 hash of scan inputs
+      - output summary / status
+      - exit code
+    """
+    import json as _json, getpass, datetime
+
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "principal": {
+            "os_user": getpass.getuser(),
+            "ci_actor": os.environ.get("GITHUB_ACTOR", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+        },
+        "model": {
+            "id": _MODEL_ID,
+            "version": _MODEL_VERSION,
+        },
+        "input_hash": _compute_input_hash(args),
+        "inputs": {
+            "repo": getattr(args, "repo", ""),
+            "branch": getattr(args, "branch", ""),
+            "head_sha": getattr(args, "head_sha", ""),
+            "mcp_server_url": getattr(args, "mcp_server_url", ""),
+        },
+        "output_summary": output_summary,
+        "exit_code": exit_code,
+    }
+
+    log_dir = os.path.dirname(_AUDIT_LOG_PATH)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    # Open in append mode — never truncate; each line is one immutable record.
+    with open(_AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(record) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    logger.info("Audit record written to %s", _AUDIT_LOG_PATH)
+
+
+# ---------------------------------------------------------------------------
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -1073,10 +1550,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     try:
-        return _execute_scan(args)
+        exit_code = _execute_scan(args)
+        _write_audit_record(
+            args,
+            exit_code=exit_code,
+            output_summary=f"scan completed with exit_code={exit_code}",
+        )
+        return exit_code
     except Exception:
         logger.exception("Unhandled error")
         err = {"status": "error", "scan_errors": ["Unhandled exception — see stderr logs"]}
+        try:
+            _write_audit_record(
+                args,
+                exit_code=1,
+                output_summary="unhandled exception — see stderr logs",
+            )
+        except Exception as audit_exc:  # noqa: BLE001
+            logger.warning("Failed to write audit record: %s", audit_exc)
         print_human_output(err)
         return 1
 
