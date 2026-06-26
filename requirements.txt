@@ -1,2 +1,2 @@
-requests==2.31.0 --index-url https://pypi.org/simple
-litellm==1.83.1 --index-url https://pypi.org/simple
+requests @ https://pypi.org/project/requests/2.31.0/
+litellm @ https://pypi.org/project/litellm/1.83.1/
