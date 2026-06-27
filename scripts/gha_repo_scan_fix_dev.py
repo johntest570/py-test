@@ -68,7 +68,8 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
+# MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
@@ -576,8 +577,15 @@ def parallel_batch_scan(
                 _collect(batch_idx, mcp_result)
             except BaseException as exc:
                 failed_batch_count += 1
-                detail = f"Batch {batch_idx}/{len(batches)} failed: {exc}"
+                # Unwrap ExceptionGroup / TaskGroup to surface the real cause
+                cause = exc
+                if hasattr(exc, "exceptions") and exc.exceptions:
+                    cause = exc.exceptions[0]
+                    if hasattr(cause, "exceptions") and cause.exceptions:
+                        cause = cause.exceptions[0]
+                detail = f"Batch {batch_idx}/{len(batches)} failed: {type(cause).__name__}: {cause}"
                 logger.error("%s", detail)
+                logger.debug("Full exception:", exc_info=exc)
                 failure_details.append(detail)
 
     return all_remediation_actions, all_reports, all_aibom, failed_batch_count, failure_details
