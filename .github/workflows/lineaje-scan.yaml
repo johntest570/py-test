@@ -44,7 +44,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           TARGET_SHA=$(git -C target-repo rev-parse HEAD)
-          python .lineaje-scanner/scripts/gha_repo_scan_fix.py \
+          python .lineaje-scanner/scripts/gha_repo_scan_fix_dev.py \
             --source-path target-repo \
             --repo "${{ github.event.inputs.source_repo }}" \
             --branch "${{ github.event.inputs.branch }}" \
