@@ -83,6 +83,11 @@ _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 #     "/lineajeidentity/api/v1/auth/native/renew-access-token"
 # )
 
+_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT = (
+    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
+    # "https://lineaje-identity-service.v2.prod.veedna.com"
+)
+
 _PAT_INTROSPECT_PATH = "/lineajeidentity/api/v1/pat/introspect"
 
 _ARCHIVE_EXCLUDE = {
@@ -256,7 +261,14 @@ def _normalize_token(raw: Any) -> str:
 
 
 def _identity_service_base_url() -> str:
-    """Derive identity service base URL from existing env vars."""
+    """Resolve identity service base URL.
+
+    Resolution order:
+      1. LINEAJE_IDENTITY_SERVICE_URL env var
+      2. Host extracted from LINEAJE_FETCH_ACCESS_TOKEN_URL
+      3. Host extracted from LINEAJE_RENEW_ACCESS_TOKEN_URL
+      4. Hardcoded default (_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT)
+    """
     explicit = os.environ.get("LINEAJE_IDENTITY_SERVICE_URL", "").strip()
     if explicit:
         return explicit.rstrip("/")
@@ -265,7 +277,7 @@ def _identity_service_base_url() -> str:
         if raw:
             parsed = urllib.parse.urlparse(raw)
             return f"{parsed.scheme}://{parsed.netloc}"
-    return ""
+    return _LINEAJE_IDENTITY_SERVICE_URL_DEFAULT
 
 
 def introspect_lineaje_pat(pat: str) -> Dict[str, Any]:
