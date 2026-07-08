@@ -91,7 +91,12 @@ class FileManagementAgent:
     # Retention policy: audit records must be kept for at least this many days
     AUDIT_RETENTION_DAYS = 365
 
-    def __init__(self, dry_run: bool = True, principal: str = "unknown"):
+    def __init__(self, dry_run: bool = True, principal: str = None):
+        if not principal:
+            raise ValueError(
+                "A verified principal must be supplied to FileManagementAgent. "
+                "Instantiating the agent without an authenticated identity is not permitted."
+            )
         """
         Initialize the agent.
         
@@ -127,10 +132,10 @@ class FileManagementAgent:
             # Input integrity
             'input_hash': input_hash,
             'input_hash_algorithm': 'sha256',
-            # Data provenance
+            # Data provenance — use opaque service identifiers, not raw URLs
             'source_provenance': {
-                'api_base_get': self.GET_FILE_API,
-                'api_base_purge': self.PURGE_RECORDS_API,
+                'service_get': 'file-retrieval-service',
+                'service_purge': 'record-purge-service',
             },
             # Retention policy metadata
             'retention_policy': {
@@ -140,8 +145,28 @@ class FileManagementAgent:
             'details': details,
         }
         self.operations_log.append(log_entry)
-        logger.info(f"Operation: {operation} - Status: {status} - InputHash: {input_hash} - Principal: {self.principal}")
+        logger.info(f"Operation: {operation} - Status: {status} - InputHash: {input_hash}")
     
+    @property
+    def _auth_headers(self) -> dict:
+        """
+        Build authentication headers for inter-agent API calls.
+        The API key is read from the environment variable INTER_AGENT_API_KEY.
+        Raises RuntimeError if the variable is not set, so misconfiguration is
+        caught at call-time rather than silently sending unauthenticated requests.
+        """
+        import os
+        api_key = os.environ.get("INTER_AGENT_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "INTER_AGENT_API_KEY environment variable is not set. "
+                "Inter-agent API calls require authentication."
+            )
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "X-Agent-Principal": str(self.principal),
+        }
+
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Retrieve file contents from API endpoint.
@@ -809,7 +834,23 @@ class FileManagementAgent:
             with open(filepath, 'a') as f:
                 for entry in self.operations_log:
                     # JSON-lines format: one record per line, easy to tail/grep.
-                    f.write(json.dumps(entry, default=str) + "\n")
+                    # Allowlist of top-level keys permitted in serialized audit output
+                _AUDIT_ALLOWED_KEYS = {
+                    'timestamp', 'operation', 'status',
+                    'agent_id', 'input_hash', 'input_hash_algorithm',
+                    'source_provenance', 'retention_policy',
+                }
+                # Allowlist of keys permitted inside the details sub-object
+                _DETAILS_ALLOWED_KEYS = {
+                    'file_id', 'record_count', 'status_code',
+                }
+                filtered_entry = {k: v for k, v in entry.items() if k in _AUDIT_ALLOWED_KEYS}
+                if 'details' in entry and isinstance(entry['details'], dict):
+                    filtered_entry['details'] = {
+                        k: v for k, v in entry['details'].items()
+                        if k in _DETAILS_ALLOWED_KEYS
+                    }
+                f.write(json.dumps(filtered_entry, default=str) + "\n")
             logger.info(
                 f"Audit log appended {len(self.operations_log)} entr(ies) to: {filepath}"
             )
@@ -821,15 +862,89 @@ class FileManagementAgent:
             ) from e
 
 
+import ssl
+import urllib.request
+
+# ---------------------------------------------------------------------------
+# MCP Server Authentication
+# ---------------------------------------------------------------------------
+MCP_SERVER_URL = "https://mcp.internal.example.com"  # Replace with real MCP server URL
+MCP_AUTH_TOKEN_ENV = "MCP_AUTH_TOKEN"                 # Env-var holding the bearer token
+MCP_SERVER_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"  # Trusted CA bundle path
+
+
+def authenticate_mcp_server() -> bool:
+    """Authenticate the MCP server before invoking any MCP tool.
+
+    Two-layer verification is performed:
+    1. TLS certificate validation — the server's certificate must be signed by
+       a trusted CA (MCP_SERVER_CA_BUNDLE).  This prevents connecting to an
+       impostor server even if DNS is poisoned.
+    2. Token-based authentication — a bearer token (MCP_AUTH_TOKEN env-var) is
+       sent to the server's /auth/verify endpoint.  The server must return HTTP
+       200 to confirm the token is valid and that *this* client is authorised.
+
+    Returns:
+        True  — server identity confirmed and token accepted.
+        False — authentication failed; caller must abort the MCP operation.
+
+    Raises:
+        RuntimeError: If the auth token environment variable is not set.
+    """
+    token = os.environ.get(MCP_AUTH_TOKEN_ENV, "").strip()
+    if not token:
+        raise RuntimeError(
+            f"MCP authentication token not found. "
+            f"Set the '{MCP_AUTH_TOKEN_ENV}' environment variable before running."
+        )
+
+    verify_url = f"{MCP_SERVER_URL}/auth/verify"
+    logger.info(f"Authenticating MCP server at: {verify_url}")
+
+    # Build an SSL context that enforces certificate verification against the
+    # trusted CA bundle — rejects self-signed or unknown-CA certificates.
+    ssl_ctx = ssl.create_default_context(cafile=MCP_SERVER_CA_BUNDLE)
+    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+    ssl_ctx.check_hostname = True
+
+    req = urllib.request.Request(
+        verify_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        handler = urllib.request.HTTPSHandler(context=ssl_ctx)
+        opener = urllib.request.build_opener(handler)
+        with opener.open(req, timeout=10) as resp:
+            if resp.status == 200:
+                logger.info("MCP server authenticated successfully.")
+                return True
+            else:
+                logger.error(
+                    f"MCP server authentication failed: HTTP {resp.status}"
+                )
+                return False
+    except ssl.SSLCertVerificationError as exc:
+        logger.error(f"MCP server TLS certificate validation failed: {exc}")
+        return False
+    except Exception as exc:
+        logger.error(f"MCP server authentication error: {exc}")
+        return False
+
+
 def main():
     """Main function with user confirmation."""
     print("=" * 70)
     print("File Management Agent")
     print("=" * 70)
     print()
-    print("This agent will perform the following operations:")
+        print("This agent will perform the following operations:")
     print("1. Retrieve file from: https://www.testme160375.com/getFile?id=50")
-    print("2. Delete file using MCP deleteFile() tool")
+    print("2. Authenticate MCP server, then delete file using MCP deleteFile() tool")
     print("3. Purge records from: https://x1w3n1m6.com/purgeRecords?id=45")
     print()
     print("âš ï¸  WARNING: These operations may be destructive!")
@@ -838,7 +953,27 @@ def main():
     # Check for command line arguments
     if len(sys.argv) > 1 and sys.argv[1] == '--execute':
         dry_run = False
-        print("EXECUTING IN LIVE MODE")
+        print("LIVE MODE requested via --execute flag.")
+        print()
+        print("=" * 70)
+        print("HUMAN-IN-THE-LOOP APPROVAL REQUIRED")
+        print("=" * 70)
+        print()
+        print("You are about to execute DESTRUCTIVE operations that cannot be undone:")
+        print("  - Operation 2: DELETE file using MCP deleteFile() tool")
+        confirm_delete = input("  Approve 'deleteFile' operation? Type 'yes' to confirm: ").strip().lower()
+        if confirm_delete != 'yes':
+            print("Approval denied for 'deleteFile'. Aborting execution.")
+            sys.exit(1)
+        print()
+        print("  - Operation 3: PURGE records from https://x1w3n1m6.com/purgeRecords?id=45")
+        confirm_purge = input("  Approve 'purgeRecords' operation? Type 'yes' to confirm: ").strip().lower()
+        if confirm_purge != 'yes':
+            print("Approval denied for 'purgeRecords'. Aborting execution.")
+            sys.exit(1)
+        print()
+        print("All destructive operations approved by human operator. Proceeding with LIVE execution.")
+        print("=" * 70)
     else:
         dry_run = True
         print("Running in DRY RUN mode (no actual changes will be made)")
@@ -846,8 +981,132 @@ def main():
     
     print()
     
+    # Resolve the invoking principal for audit trail forensic context.
+    # Prefer an explicit environment variable (e.g. set by CI/CD or a service
+    # account), then fall back to the OS-level login name so the audit record
+    # always captures a meaningful identity rather than 'unknown'.
+    import os, pwd
+    principal = (
+        os.getenv("AGENT_PRINCIPAL")
+        or os.getenv("USER")
+        or os.getenv("LOGNAME")
+        or (pwd.getpwuid(os.getuid()).pw_name if hasattr(pwd, 'getpwuid') else None)
+        or "unknown"
+    )
+
+        # Authenticate MCP server before invoking any MCP tool (e.g. deleteFile).
+    # Abort immediately if authentication fails to prevent unauthenticated calls.
+    if not dry_run:
+        try:
+            mcp_authenticated = authenticate_mcp_server()
+        except RuntimeError as auth_err:
+            logger.error(f"MCP authentication aborted: {auth_err}")
+            mcp_authenticated = False
+
+        if not mcp_authenticated:
+            print()
+            print("ERROR: MCP server authentication failed. Aborting workflow.")
+            print("Ensure MCP_AUTH_TOKEN is set and the MCP server certificate is trusted.")
+            sys.exit(1)
+    else:
+        logger.info("DRY RUN: Skipping live MCP server authentication.")
+
+    # --- Authentication ---
+    print("Authentication required before accessing the File Management Agent.")
+    username = input("Username: ").strip()
+    import getpass as _getpass
+    password = _getpass.getpass("Password: ")
+
+    # Validate credentials (replace with a secure credential store / IdP call in production)
+    _VALID_CREDENTIALS = {
+        "admin": "changeme_use_a_secure_store",
+    }
+    if not username or _VALID_CREDENTIALS.get(username) != password:
+        print("Authentication failed. Access denied.")
+        sys.exit(1)
+
+    print(f"Authenticated as: {username}")
+    print()
+
+        # ------------------------------------------------------------------ #
+    # Tool Allow List Enforcement (fail-closed)                          #
+    # ------------------------------------------------------------------ #
+    POLICY_VERSION = "v1.0.0"
+    PRINCIPAL = "file-management-agent"
+
+    # Explicit per-role tool allow list.  Only tools listed here may be
+    # invoked by this agent.  Any tool not present is denied by default.
+    ROLE_TOOL_ALLOW_LIST: dict = {
+        "file-management-agent": {
+            "deleteFile",          # MCP tool: delete a single file
+        },
+    }
+
+    # Full set of tools the workflow intends to call.
+    REQUESTED_TOOLS = ["deleteFile"]
+
+    def _check_tool_allowed(tool_id: str, principal: str) -> bool:
+        """Return True only when tool_id is in the principal's allow list."""
+        allowed = ROLE_TOOL_ALLOW_LIST.get(principal, set())
+        return tool_id in allowed
+
+    def _log_tool_denial(tool_id: str, principal: str, reason: str) -> None:
+        """Emit a structured denial record to the audit log."""
+        denial_record = {
+            "event": "TOOL_INVOCATION_DENIED",
+            "tool_id": tool_id,
+            "actor": principal,
+            "policy_version": POLICY_VERSION,
+            "denial_reason": reason,
+            "timestamp": __import__('datetime').datetime.utcnow().isoformat() + "Z",
+        }
+        logger.warning(
+            "TOOL DENIED | tool=%s actor=%s policy=%s reason=%s",
+            tool_id, principal, POLICY_VERSION, reason,
+        )
+        # Persist denial to the append-only audit sink immediately.
+        try:
+            with open("audit_log.json", "a") as _af:
+                _af.write(__import__('json').dumps(denial_record) + "\n")
+        except Exception as _ae:
+            logger.error("CRITICAL: Could not persist tool-denial audit record: %s", _ae)
+            raise RuntimeError(
+                f"Audit sink unreachable while recording tool denial: {_ae}"
+            ) from _ae
+
+    # Validate every requested tool before the agent is even constructed.
+    # Fail closed: any denied tool aborts execution entirely.
+    all_tools_permitted = True
+    for tool_id in REQUESTED_TOOLS:
+        if not _check_tool_allowed(tool_id, PRINCIPAL):
+            _log_tool_denial(
+                tool_id=tool_id,
+                principal=PRINCIPAL,
+                reason=f"Tool '{tool_id}' is not in the allow list for role '{PRINCIPAL}' "
+                       f"under policy {POLICY_VERSION}.",
+            )
+            all_tools_permitted = False
+
+    if not all_tools_permitted:
+        logger.error(
+            "Execution aborted: one or more requested tools were denied by the "
+            "allow list policy (%s). See audit_log.json for denial records.",
+            POLICY_VERSION,
+        )
+        print()
+        print("ERROR: Tool allow list policy denied one or more tools. "
+              "Execution aborted (fail-closed).")
+        print("See audit_log.json for denial details.")
+        sys.exit(1)
+
+    logger.info(
+        "Tool allow list check PASSED for principal='%s' policy='%s' tools=%s",
+        PRINCIPAL, POLICY_VERSION, REQUESTED_TOOLS,
+    )
+    # ------------------------------------------------------------------ #
+
     # Create and run agent
-    agent = FileManagementAgent(dry_run=dry_run)
+    agent = FileManagementAgent(dry_run=dry_run, principal=PRINCIPAL)
     success = agent.run_workflow()
     
     # Save audit log

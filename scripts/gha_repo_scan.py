@@ -65,6 +65,99 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger("gha_repo_scan")
 
 # ===========================================================================
+# MCP Output Sanitization
+# ===========================================================================
+
+# Maximum allowed sizes for MCP tool outputs
+_MCP_MAX_STRING_LEN = 2_000_000   # 2 MB of text
+_MCP_MAX_LIST_ITEMS = 100_000
+_MCP_MAX_DICT_KEYS  = 10_000
+
+# Characters that should never appear in structured tool output
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+# Simple heuristic for script/template injection attempts
+_INJECTION_RE = re.compile(
+    r'(<\s*script|javascript\s*:|data\s*:|vbscript\s*:|on\w+\s*=|\{\{|\$\{)',
+    re.IGNORECASE,
+)
+
+
+def _sanitize_mcp_string(value: str, field_path: str = "") -> str:
+    """Sanitize a single string value returned from an MCP tool."""
+    if not isinstance(value, str):
+        raise ValueError(f"MCP output field '{field_path}' expected str, got {type(value).__name__}")
+    if len(value) > _MCP_MAX_STRING_LEN:
+        logger.warning(
+            "MCP output field '%s' truncated from %d to %d chars",
+            field_path, len(value), _MCP_MAX_STRING_LEN,
+        )
+        value = value[:_MCP_MAX_STRING_LEN]
+    # Strip ASCII control characters (keep \t, \n, \r)
+    value = _CONTROL_CHAR_RE.sub('', value)
+    # Warn on injection-like patterns but do not silently drop content;
+    # instead escape the dangerous token so it cannot be interpreted.
+    def _escape_injection(m: re.Match) -> str:  # noqa: E306
+        logger.warning(
+            "MCP output field '%s' contains potential injection pattern: %r",
+            field_path, m.group(0),
+        )
+        return '[SANITIZED]'
+    value = _INJECTION_RE.sub(_escape_injection, value)
+    return value
+
+
+def _sanitize_mcp_output(value: Any, field_path: str = "root", _depth: int = 0) -> Any:
+    """Recursively validate and sanitize output returned from an MCP tool call.
+
+    Accepted types: str, int, float, bool, None, list, dict.
+    Any other type is coerced to its string representation.
+    Raises ValueError for structurally invalid payloads.
+    """
+    if _depth > 50:
+        raise ValueError(f"MCP output at '{field_path}' exceeds maximum nesting depth")
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+
+    if isinstance(value, str):
+        return _sanitize_mcp_string(value, field_path)
+
+    if isinstance(value, list):
+        if len(value) > _MCP_MAX_LIST_ITEMS:
+            logger.warning(
+                "MCP output list at '%s' truncated from %d to %d items",
+                field_path, len(value), _MCP_MAX_LIST_ITEMS,
+            )
+            value = value[:_MCP_MAX_LIST_ITEMS]
+        return [
+            _sanitize_mcp_output(item, f"{field_path}[{i}]", _depth + 1)
+            for i, item in enumerate(value)
+        ]
+
+    if isinstance(value, dict):
+        if len(value) > _MCP_MAX_DICT_KEYS:
+            logger.warning(
+                "MCP output dict at '%s' has %d keys, keeping first %d",
+                field_path, len(value), _MCP_MAX_DICT_KEYS,
+            )
+            value = dict(list(value.items())[:_MCP_MAX_DICT_KEYS])
+        return {
+            _sanitize_mcp_string(str(k), f"{field_path}.key"): _sanitize_mcp_output(
+                v, f"{field_path}.{k}", _depth + 1
+            )
+            for k, v in value.items()
+        }
+
+    # Unexpected type — coerce safely
+    logger.warning(
+        "MCP output field '%s' has unexpected type %s; coercing to str",
+        field_path, type(value).__name__,
+    )
+    return _sanitize_mcp_string(repr(value), field_path)
+
+
+# ===========================================================================
 # Singapore PII Detection
 # ===========================================================================
 
@@ -98,11 +191,136 @@ def _detect_sg_pii(content: str) -> List[str]:
     return found
 
 
-def _file_content_safe_for_upload(file_path: str, content: str) -> bool:
-    """Return True if *content* contains no Singapore PII, False otherwise.
+# ===========================================================================
+# Malicious-content / prompt-injection detection helpers
+# ===========================================================================
 
-    Logs a warning (without echoing the sensitive content) when PII is found.
+# Zero-width and other invisible Unicode characters commonly used to hide text
+_INVISIBLE_CHARS_RE = re.compile(
+    r'[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u2028\u2029]'
+)
+
+# HTML/CSS tricks that render text invisible (white colour, font-size 0/1, display:none)
+_INVISIBLE_STYLE_RE = re.compile(
+    r'(?:color\s*:\s*(?:white|#fff{1,3}|rgba?\(\s*255\s*,\s*255\s*,\s*255)|'
+    r'font-size\s*:\s*[01](?:\.\d+)?\s*(?:px|pt|em|rem)?\s*;|'
+    r'display\s*:\s*none|'
+    r'visibility\s*:\s*hidden|'
+    r'opacity\s*:\s*0)',
+    re.IGNORECASE,
+)
+
+# Suspicious AI-directive / prompt-injection keywords
+_PROMPT_INJECTION_RE = re.compile(
+    r'(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?|'
+    r'disregard\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?|'
+    r'forget\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?|'
+    r'override\s+(?:your\s+)?(?:instructions?|directives?|rules?)|'
+    r'you\s+are\s+now\s+(?:a\s+)?(?:DAN|jailbreak|unrestricted)|'
+    r'act\s+as\s+(?:if\s+you\s+(?:have\s+no|are\s+without)\s+restrictions?|an?\s+unrestricted)|'
+    r'system\s*:\s*you\s+(?:must|shall|will)|'
+    r'<\s*(?:system|SYSTEM)\s*>|'
+    r'\[\s*(?:SYSTEM|INST|INSTRUCTION)\s*\]|'
+    r'###\s*(?:System|Instruction|Prompt))',
+    re.IGNORECASE,
+)
+
+# Leetspeak substitution table for normalisation before pattern matching
+_LEET_TABLE = str.maketrans({
+    '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's',
+    '6': 'g', '7': 't', '8': 'b', '@': 'a', '$': 's',
+    '!': 'i', '+': 't', '|': 'i',
+})
+
+# Suspicious shell / binary patterns
+_SHELL_CMD_RE = re.compile(
+    r'(?:/bin/(?:sh|bash|zsh|dash|ksh)|'
+    r'(?:^|\s)(?:curl|wget|nc|ncat|netcat|python|perl|ruby|php)\s+[\-/]|'
+    r'(?:exec|eval|system|popen|subprocess)\s*\(|'
+    r'(?:base64\s+-d|base64\s+--decode)|'
+    r'\$\(.*\)|`[^`]+`)',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# ELF / PE / Mach-O magic bytes (binary executables)
+_BINARY_MAGIC = [
+    b'\x7fELF',          # ELF
+    b'MZ',               # PE (Windows)
+    b'\xca\xfe\xba\xbe', # Mach-O fat binary
+    b'\xfe\xed\xfa\xce', # Mach-O 32-bit
+    b'\xfe\xed\xfa\xcf', # Mach-O 64-bit
+    b'\xce\xfa\xed\xfe', # Mach-O 32-bit LE
+    b'\xcf\xfa\xed\xfe', # Mach-O 64-bit LE
+]
+
+
+def _contains_invisible_content(content: str) -> bool:
+    """Detect zero-width / invisible Unicode characters or CSS invisibility tricks."""
+    if _INVISIBLE_CHARS_RE.search(content):
+        return True
+    if _INVISIBLE_STYLE_RE.search(content):
+        return True
+    return False
+
+
+def _contains_prompt_injection(content: str) -> bool:
+    """Detect direct prompt-injection directives in plain text."""
+    return bool(_PROMPT_INJECTION_RE.search(content))
+
+
+def _contains_leetspeak_injection(content: str) -> bool:
+    """Normalise leetspeak substitutions then re-check for prompt-injection patterns."""
+    normalised = content.translate(_LEET_TABLE)
+    return bool(_PROMPT_INJECTION_RE.search(normalised))
+
+
+def _contains_base64_injection(content: str) -> bool:
+    """Decode any plausible base64 blobs and check the decoded text for injections."""
+    # Match base64 tokens that are at least 40 chars (long enough to hide a sentence)
+    b64_re = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+    for match in b64_re.finditer(content):
+        token = match.group(0)
+        # Pad to a multiple of 4 if needed
+        padding = (4 - len(token) % 4) % 4
+        try:
+            decoded_bytes = base64.b64decode(token + '=' * padding)
+            decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
+        except Exception:
+            continue
+        if _PROMPT_INJECTION_RE.search(decoded_text):
+            return True
+        if _SHELL_CMD_RE.search(decoded_text):
+            return True
+    return False
+
+
+def _contains_binary_executable(content: str) -> bool:
+    """Detect binary executable magic bytes in the raw content bytes."""
+    raw = content.encode('utf-8', errors='replace')
+    for magic in _BINARY_MAGIC:
+        if magic in raw:
+            return True
+    return False
+
+
+def _contains_shell_commands(content: str) -> bool:
+    """Detect embedded shell commands or interpreter invocations."""
+    return bool(_SHELL_CMD_RE.search(content))
+
+
+def _file_content_safe_for_upload(file_path: str, content: str) -> bool:
+    """Return True only if *content* passes ALL safety checks.
+
+    Checks performed (fail-closed — any failure blocks the upload):
+    1. Singapore PII detection
+    2. Invisible / hidden content (zero-width chars, CSS tricks)
+    3. Direct prompt-injection directives
+    4. Leetspeak-obfuscated prompt-injection directives
+    5. Base64-encoded prompt-injection or shell commands
+    6. Binary executable magic bytes
+    7. Embedded shell commands
     """
+    # 1. Singapore PII
     pii_categories = _detect_sg_pii(content)
     if pii_categories:
         logger.warning(
@@ -111,6 +329,55 @@ def _file_content_safe_for_upload(file_path: str, content: str) -> bool:
             ", ".join(pii_categories),
         )
         return False
+
+    # 2. Invisible / hidden content
+    if _contains_invisible_content(content):
+        logger.warning(
+            "Invisible/hidden content detected in '%s' — file excluded from upload.",
+            file_path,
+        )
+        return False
+
+    # 3. Direct prompt injection
+    if _contains_prompt_injection(content):
+        logger.warning(
+            "Prompt-injection directive detected in '%s' — file excluded from upload.",
+            file_path,
+        )
+        return False
+
+    # 4. Leetspeak-obfuscated prompt injection
+    if _contains_leetspeak_injection(content):
+        logger.warning(
+            "Leetspeak prompt-injection directive detected in '%s' — file excluded from upload.",
+            file_path,
+        )
+        return False
+
+    # 5. Base64-encoded injection
+    if _contains_base64_injection(content):
+        logger.warning(
+            "Base64-encoded prompt-injection or shell command detected in '%s' — file excluded from upload.",
+            file_path,
+        )
+        return False
+
+    # 6. Binary executable magic bytes
+    if _contains_binary_executable(content):
+        logger.warning(
+            "Binary executable content detected in '%s' — file excluded from upload.",
+            file_path,
+        )
+        return False
+
+    # 7. Shell commands
+    if _contains_shell_commands(content):
+        logger.warning(
+            "Shell command content detected in '%s' — file excluded from upload.",
+            file_path,
+        )
+        return False
+
     return True
 
 
@@ -134,7 +401,80 @@ _TOOL_ALLOW_LIST: frozenset = frozenset({
 
 _TOOL_POLICY_VERSION = "v1.0.0"
 
+import hashlib
+import uuid
+from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+
 _audit_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Workflow trace identifier — generated once per process invocation.
+# All multi-step workflow actions (scan → get_report → get_violations →
+# get_aibom) share this identifier so the full causal chain can be
+# reconstructed end-to-end from the audit trail.
+# ---------------------------------------------------------------------------
+_WORKFLOW_TRACE_ID: str = str(uuid.uuid4())
+
+# ---------------------------------------------------------------------------
+# Persistent audit trail sink.
+# Retention policy: rotate at 10 MB, keep 30 compressed backup files
+# (~300 MB max on disk).  Files are written to AUDIT_LOG_PATH (default:
+# audit_trail.jsonl in the workspace root).  Operators MUST ship these
+# files to a tamper-evident, off-runner store (e.g. S3 with Object Lock)
+# before the GHA runner is recycled to satisfy long-term retention
+# requirements.
+# ---------------------------------------------------------------------------
+_AUDIT_LOG_PATH = os.environ.get("AUDIT_LOG_PATH", "audit_trail.jsonl")
+_AUDIT_MAX_BYTES = 10 * 1024 * 1024   # 10 MB per file
+_AUDIT_BACKUP_COUNT = 30               # 30 rotated files → ~300 MB max
+
+_audit_file_handler = _RotatingFileHandler(
+    _AUDIT_LOG_PATH,
+    maxBytes=_AUDIT_MAX_BYTES,
+    backupCount=_AUDIT_BACKUP_COUNT,
+    encoding="utf-8",
+    delay=False,
+)
+
+
+def _compute_input_hash(tool_id: str, kwargs: dict) -> str:
+    """Return a SHA-256 hex digest of the canonical JSON representation of
+    the tool invocation inputs (tool_id + sorted kwargs)."""
+    payload = json.dumps({"tool_id": tool_id, "kwargs": kwargs}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_audit_record(label: str, record: str) -> None:
+    """Write *record* to both stderr and the persistent rotating audit file.
+
+    Raises RuntimeError (fail-closed) if either sink write fails so that
+    a logging failure is never silently swallowed.
+    """
+    errors = []
+    with _audit_lock:
+        # --- stderr sink (captured by GHA runner log) ---
+        try:
+            print(f"{label} {record}", file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"stderr write failed: {exc}")
+
+        # --- persistent rotating file sink ---
+        try:
+            _audit_file_handler.stream  # ensure open
+            _audit_file_handler.emit(
+                logging.makeLogRecord({"msg": record, "levelno": logging.INFO})
+            )
+            # RotatingFileHandler.emit does not flush automatically
+            if _audit_file_handler.stream:
+                _audit_file_handler.stream.flush()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"file sink write failed: {exc}")
+
+    if errors:
+        raise RuntimeError(
+            "AUDIT SINK FAILURE — execution halted (fail-closed): "
+            + "; ".join(errors)
+        )
 
 
 def _audit_log_denial(
@@ -142,29 +482,78 @@ def _audit_log_denial(
     tool_id: str,
     policy_version: str,
     denial_reason: str,
+    input_hash: str = "",
+    trace_id: str = "",
+    data_lineage: str = "",
 ) -> None:
-    """Write a denial record to the protected audit sink (stderr).
+    """Write a denial record to all audit sinks.
 
-    The record is written to stderr (a protected, append-only sink in GHA)
-    so it is captured by the runner log and cannot be suppressed by the
-    calling process.
+    Includes input_hash, trace_id, and data_lineage so the record is
+    sufficient for forensic reconstruction of the denied AI decision.
+    Raises RuntimeError if any sink write fails (fail-closed).
     """
     record = json.dumps({
         "audit_event": "tool_invocation_denied",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trace_id": trace_id or _WORKFLOW_TRACE_ID,
         "actor": actor,
         "tool_id": tool_id,
         "policy_version": policy_version,
         "denial_reason": denial_reason,
+        "input_hash": input_hash,
+        "data_lineage": data_lineage,
     })
-    with _audit_lock:
-        print(f"[AUDIT DENIAL] {record}", file=sys.stderr, flush=True)
+    _write_audit_record("[AUDIT DENIAL]", record)
 
 
-def enforce_tool_allow_list(tool_id: str, actor: str = "gha_repo_scan") -> None:
+def _audit_log_approval(
+    actor: str,
+    tool_id: str,
+    policy_version: str,
+    input_hash: str,
+    output_hash: str,
+    model_id: str = "mcp-lineaje",
+    model_version: str = "unknown",
+    trace_id: str = "",
+    data_lineage: str = "",
+) -> None:
+    """Write an approval/execution record to all audit sinks.
+
+    Must be called immediately after every successful AI tool invocation so
+    that the audit trail contains a complete record of every approved AI
+    determination, including model identifier, version, input hash, output
+    hash, timestamp, and principal.
+    Raises RuntimeError if any sink write fails (fail-closed).
+    """
+    record = json.dumps({
+        "audit_event": "tool_invocation_approved",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "trace_id": trace_id or _WORKFLOW_TRACE_ID,
+        "actor": actor,
+        "tool_id": tool_id,
+        "policy_version": policy_version,
+        "model_id": model_id,
+        "model_version": model_version,
+        "input_hash": input_hash,
+        "output_hash": output_hash,
+        "data_lineage": data_lineage,
+    })
+    _write_audit_record("[AUDIT APPROVAL]", record)
+
+
+def enforce_tool_allow_list(
+    tool_id: str,
+    actor: str = "gha_repo_scan",
+    input_kwargs: dict | None = None,
+) -> None:
     """Raise RuntimeError and emit an audit denial record if *tool_id* is not
     on the explicit allow list.  Must be called before every MCP tool
-    invocation."""
+    invocation.
+
+    *input_kwargs* is used to compute the input_hash for forensic context.
+    """
+    kwargs = input_kwargs or {}
+    input_hash = _compute_input_hash(tool_id, kwargs)
     if tool_id not in _TOOL_ALLOW_LIST:
         denial_reason = (
             f"Tool '{tool_id}' is not present in the explicit allow list "
@@ -175,8 +564,20 @@ def enforce_tool_allow_list(tool_id: str, actor: str = "gha_repo_scan") -> None:
             tool_id=tool_id,
             policy_version=_TOOL_POLICY_VERSION,
             denial_reason=denial_reason,
+            input_hash=input_hash,
+            trace_id=_WORKFLOW_TRACE_ID,
+            data_lineage="enforce_tool_allow_list",
         )
         raise RuntimeError(denial_reason)
+    # Log the allowed invocation request so every permitted interaction is
+    # captured in the audit trail (policy: MCP clients must log all
+    # interactions with the MCP server).
+    _audit_log_interaction(
+        actor=actor,
+        tool_id=tool_id,
+        policy_version=_TOOL_POLICY_VERSION,
+        event="request",
+    )
 logger.info("[MCP] Server URL configured: %s", MCP_SERVER_URL)
 
 MAX_SCAN_WORKERS = 4
@@ -576,7 +977,8 @@ def _run_mcp_scan_via_client(
                 result = _parse_tool_result(
                     await session2.call_tool("analyze_uploaded_archive", arguments=analyze_args)
                 )
-                return result
+                result = _apply_mcp_sanitization(result)
+    return result
 
     return asyncio.run(_scan())
 
