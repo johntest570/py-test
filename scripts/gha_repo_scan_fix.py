@@ -30,7 +30,7 @@ Output (stdout, JSON)::
 
 Required environment variable::
 
-    LINEAJE_PAT_TOKEN  — Lineaje PAT token used directly as MCP bearer
+    LINEAJE_PAT_TOKEN  — Lineaje refresh token (exchanged for short-lived access tokens)
 
 Exit codes::
 
@@ -68,27 +68,17 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
+MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
-
-# Refresh-token renew URL — not used with PAT auth (kept for reference)
-# _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
-#     "https://lineaje-idp-service.commercialdev.dev.veedna.com"
-#     # "https://lineaje-identity-service.v2.prod.veedna.com"
-#     "/lineajeidentity/api/v1/auth/native/renew-access-token"
-# )
-
-_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT = (
-    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
-    # "https://lineaje-identity-service.v2.prod.veedna.com"
+_LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
+    "https://lineaje-identity-service.v2.prod.veedna.com"
+    "/lineajeidentity/api/v1/auth/native/renew-access-token"
 )
-
-_PAT_INTROSPECT_PATH = "/lineajeidentity/api/v1/pat/introspect"
 
 _ARCHIVE_EXCLUDE = {
     ".git", ".gitignore", ".gitattributes", ".gitmodules", ".hg", ".svn",
@@ -154,176 +144,115 @@ def _normalize_token(raw: Any) -> str:
     return s
 
 
-# Kept for reference — used by RefreshTokenTokenManager (commented out below)
-# def _normalize_url(url: Optional[str]) -> str:
-#     if url is None:
-#         return ""
-#     u = str(url).strip()
-#     if len(u) >= 2 and u[0] == u[-1] and u[0] in "\"'":
-#         u = u[1:-1].strip()
-#     return u
+def _normalize_url(url: Optional[str]) -> str:
+    if url is None:
+        return ""
+    u = str(url).strip()
+    if len(u) >= 2 and u[0] == u[-1] and u[0] in "\"'":
+        u = u[1:-1].strip()
+    return u
 
 
-# Kept for reference — used by RefreshTokenTokenManager (commented out below)
-# def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
-#     text = raw_text.strip() if raw_text else ""
-#     try:
-#         parsed: Any = json.loads(raw_text)
-#     except json.JSONDecodeError:
-#         # Some endpoints return a bare JWT string
-#         parts = text.split(".")
-#         if context == "renew-access-token" and len(parts) == 3:
-#             return {"access_token": text}
-#         raise RuntimeError(f"{context}: response is not valid JSON") from None
-#     for _ in range(8):
-#         if isinstance(parsed, dict):
-#             return parsed
-#         if isinstance(parsed, str):
-#             s = parsed.strip()
-#             if not s:
-#                 raise RuntimeError(f"{context}: empty JSON string where object expected")
-#             try:
-#                 parsed = json.loads(s)
-#             except json.JSONDecodeError:
-#                 parts = s.split(".")
-#                 if context == "renew-access-token" and len(parts) == 3:
-#                     return {"access_token": s}
-#                 raise RuntimeError(f"{context}: server returned error string: {s[:800]}") from None
-#             continue
-#         break
-#     raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
+def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
+    text = raw_text.strip() if raw_text else ""
+    try:
+        parsed: Any = json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Some endpoints return a bare JWT string
+        parts = text.split(".")
+        if context == "renew-access-token" and len(parts) == 3:
+            return {"access_token": text}
+        raise RuntimeError(f"{context}: response is not valid JSON") from None
+    for _ in range(8):
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            s = parsed.strip()
+            if not s:
+                raise RuntimeError(f"{context}: empty JSON string where object expected")
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                parts = s.split(".")
+                if context == "renew-access-token" and len(parts) == 3:
+                    return {"access_token": s}
+                raise RuntimeError(f"{context}: server returned error string: {s[:800]}") from None
+            continue
+        break
+    raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
 
 
-# Refresh-token exchange manager — not used with PAT auth (kept for reference)
-# class RefreshTokenTokenManager:
-#     """Exchange a refresh token for short-lived MCP access tokens, auto-renewing before expiry."""
-#
-#     def __init__(self, refresh_token: str, renew_access_token_url: Optional[str] = None) -> None:
-#         self._refresh_token = _normalize_token(refresh_token)
-#         if not self._refresh_token:
-#             raise ValueError("LINEAJE_PAT_TOKEN must be non-empty")
-#         self._renew_url = (
-#             _normalize_url(renew_access_token_url)
-#             or _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
-#             or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
-#         ).rstrip("/")
-#         self._lock = threading.Lock()
-#         self._access_token = ""
-#         self._access_deadline = 0.0
-#         try:
-#             self._skew_sec = int(os.environ.get(
-#                 "LINEAJE_TOKEN_REFRESH_SKEW_SEC", str(_DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC)
-#             ))
-#         except ValueError:
-#             self._skew_sec = _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC
-#
-#     def get_access_token(self) -> str:
-#         with self._lock:
-#             return self._get_unlocked()
-#
-#     def _get_unlocked(self) -> str:
-#         now = time.time()
-#         if self._access_token and now < self._access_deadline - self._skew_sec:
-#             return self._access_token
-#         self._renew()
-#         if not self._access_token:
-#             raise RuntimeError("renew-access-token did not return access_token")
-#         return self._access_token
-#
-#     def _renew(self) -> None:
-#         q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
-#         url = f"{self._renew_url}?{q}"
-#         req = urllib.request.Request(
-#             url, data=b"null",
-#             headers={"Content-Type": "application/json"},
-#             method="POST",
-#         )
-#         try:
-#             with urllib.request.urlopen(req, timeout=120) as resp:
-#                 data = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
-#         except urllib.error.HTTPError as exc:
-#             body = exc.read().decode(errors="replace")
-#             raise RuntimeError(f"renew-access-token HTTP {exc.code}: {body[:800]}") from exc
-#         at = (data.get("access_token") or "").strip()
-#         if not at:
-#             raise RuntimeError(f"Token response missing access_token: {data!r}")
-#         self._access_token = at
-#         rt = (data.get("refresh_token") or "").strip()
-#         if rt:
-#             self._refresh_token = rt
-#         exp = data.get("expires_in")
-#         try:
-#             exp_sec = int(exp) if exp is not None else 3600
-#         except (TypeError, ValueError):
-#             exp_sec = 3600
-#         self._access_deadline = time.time() + max(60, exp_sec)
-#         logger.debug("Access token renewed; expires in %ds", exp_sec)
+class RefreshTokenTokenManager:
+    """Exchange LINEAJE_PAT_TOKEN for short-lived MCP access tokens, auto-renewing before expiry."""
 
+    def __init__(self, refresh_token: str, renew_access_token_url: Optional[str] = None) -> None:
+        self._refresh_token = _normalize_token(refresh_token)
+        if not self._refresh_token:
+            raise ValueError("LINEAJE_PAT_TOKEN must be non-empty")
+        self._renew_url = (
+            _normalize_url(renew_access_token_url)
+            or _normalize_url(os.environ.get("LINEAJE_RENEW_ACCESS_TOKEN_URL"))
+            or _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
+        ).rstrip("/")
+        self._lock = threading.Lock()
+        self._access_token = ""
+        self._access_deadline = 0.0
+        try:
+            self._skew_sec = int(os.environ.get(
+                "LINEAJE_TOKEN_REFRESH_SKEW_SEC", str(_DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC)
+            ))
+        except ValueError:
+            self._skew_sec = _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC
 
-def _identity_service_base_url() -> str:
-    """Resolve identity service base URL.
+    def get_access_token(self) -> str:
+        with self._lock:
+            return self._get_unlocked()
 
-    Resolution order:
-      1. LINEAJE_IDENTITY_SERVICE_URL env var
-      2. Host extracted from LINEAJE_FETCH_ACCESS_TOKEN_URL
-      3. Host extracted from LINEAJE_RENEW_ACCESS_TOKEN_URL
-      4. Hardcoded default (_LINEAJE_IDENTITY_SERVICE_URL_DEFAULT)
-    """
-    explicit = os.environ.get("LINEAJE_IDENTITY_SERVICE_URL", "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-    for env_var in ("LINEAJE_FETCH_ACCESS_TOKEN_URL", "LINEAJE_RENEW_ACCESS_TOKEN_URL"):
-        raw = os.environ.get(env_var, "").strip()
-        if raw:
-            parsed = urllib.parse.urlparse(raw)
-            return f"{parsed.scheme}://{parsed.netloc}"
-    return _LINEAJE_IDENTITY_SERVICE_URL_DEFAULT
+    def _get_unlocked(self) -> str:
+        now = time.time()
+        if self._access_token and now < self._access_deadline - self._skew_sec:
+            return self._access_token
+        self._renew()
+        if not self._access_token:
+            raise RuntimeError("renew-access-token did not return access_token")
+        return self._access_token
 
-
-def introspect_lineaje_pat(pat: str) -> Dict[str, Any]:
-    """Validate a Lineaje PAT via the identity service introspect endpoint."""
-    base = _identity_service_base_url()
-    if not base:
-        raise RuntimeError(
-            "Identity service URL not configured. "
-            "Set LINEAJE_IDENTITY_SERVICE_URL or LINEAJE_FETCH_ACCESS_TOKEN_URL."
+    def _renew(self) -> None:
+        q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
+        url = f"{self._renew_url}?{q}"
+        req = urllib.request.Request(
+            url, data=b"null",
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-    url = base + _PAT_INTROSPECT_PATH
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {pat}", "Accept": "application/json"},
-        method="GET",
-    )
-    logger.info("PAT introspect: GET %s", url)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode()
-            logger.info("PAT introspect: HTTP %s", getattr(resp, "status", None) or resp.getcode())
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode(errors="replace")
-        raise RuntimeError(f"PAT introspect HTTP {exc.code}: {err_body[:400]}") from exc
-    try:
-        info = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"PAT introspect returned non-JSON: {raw[:200]}") from exc
-    logger.info(
-        "PAT introspect: user_email=%s tenant_id=%s company_id=%s",
-        info.get("user_email", ""), info.get("tenant_id", ""), info.get("company_id", ""),
-    )
-    return info
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = _identity_token_response_dict(resp.read().decode(), context="renew-access-token")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            raise RuntimeError(f"renew-access-token HTTP {exc.code}: {body[:800]}") from exc
+        at = (data.get("access_token") or "").strip()
+        if not at:
+            raise RuntimeError(f"Token response missing access_token: {data!r}")
+        self._access_token = at
+        rt = (data.get("refresh_token") or "").strip()
+        if rt:
+            self._refresh_token = rt
+        exp = data.get("expires_in")
+        try:
+            exp_sec = int(exp) if exp is not None else 3600
+        except (TypeError, ValueError):
+            exp_sec = 3600
+        self._access_deadline = time.time() + max(60, exp_sec)
+        logger.debug("Access token renewed; expires in %ds", exp_sec)
 
 
 def build_bearer_getter() -> Callable[[], str]:
-    """Return a callable that yields the Lineaje PAT directly as the MCP bearer token."""
     pat = _normalize_token(os.environ.get("LINEAJE_PAT_TOKEN", ""))
     if not pat:
         raise RuntimeError("LINEAJE_PAT_TOKEN is not set")
-    logger.info("Auth: Lineaje PAT token")
-    return lambda: pat
-
-    # Refresh-token exchange path — not used with PAT auth (kept for reference)
-    # mgr = RefreshTokenTokenManager(pat)
-    # return mgr.get_access_token
+    mgr = RefreshTokenTokenManager(pat)
+    return mgr.get_access_token
 
 # ===========================================================================
 # File collection
@@ -711,7 +640,7 @@ def _apply_fix_entry(content: str, original: str, replacement: str) -> Tuple[str
             norm_walked += len(_normalize_for_patch_match(ch))
         else:
             real_idx = len(content)
-        sub = content[real_idx: real_idx + orig_len + 50]
+        sub = content[real_idx : real_idx + orig_len + 50]
         if orig_stripped in sub:
             actual_idx = content.find(orig_stripped, real_idx)
             if actual_idx != -1:
@@ -906,16 +835,16 @@ def _create_fix_pr(
     files_list = "\n".join(f"- `{f}`" for f in committed)
     failed_list = ("\n".join(f"- `{f}`" for f in (failed_files or []))) or "_None_"
     pr_body_lines = [
-        "## UniFAI AI Policy Remediation",
-        "",
+        f"## UniFAI AI Policy Remediation",
+        f"",
         f"Automated fixes for policy violations detected in `{branch}` at `{sha_short}`.",
-        "",
+        f"",
         f"### Files remediated ({len(committed)})",
-        "",
+        f"",
         files_list,
-        "",
+        f"",
         f"### Files without fixes ({len(failed_files or [])})",
-        "",
+        f"",
         failed_list,
     ]
     if report:
@@ -960,14 +889,9 @@ def _execute_scan(args: argparse.Namespace) -> int:
 
     try:
         bearer_getter = build_bearer_getter()
-        pat_token = bearer_getter()
-        pat_info = introspect_lineaje_pat(pat_token)
-        logger.info(
-            "Auth OK — user=%s tenant=%s company=%s",
-            pat_info.get("user_email", ""),
-            pat_info.get("tenant_id", ""),
-            pat_info.get("company_id", ""),
-        )
+        # Eagerly fetch a token at startup to catch auth errors early
+        bearer_getter()
+        logger.info("Auth OK — LINEAJE_PAT_TOKEN accepted")
     except Exception as exc:
         output = build_json_output(
             status="error", repo=repo, branch=branch, head_sha=head_sha,
@@ -1021,7 +945,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
 
     elapsed = time.perf_counter() - scan_start
     logger.info(
-        "Scan complete in %.1fs: %d violation(s), %d AIBOM entry/ies, %d failed batch(es)",
+        "Scan complete in %.1fs: %d violation(s), %d AIBOM entr(ies), %d failed batch(es)",
         elapsed, len(all_violations), len(all_aibom), failed_batches_count,
     )
 
