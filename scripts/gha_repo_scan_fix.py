@@ -100,7 +100,7 @@ _ARCHIVE_EXCLUDE_GLOBS = {
     "poetry.lock", "Gemfile.lock", "Cargo.lock", "composer.lock",
     "*.min.js", "*.min.css", "*.map",
     "*_pb2.py", "*.pb.go", "*.pb.cc", "*.pb.h",
-    "*.snap",
+    "*.snap", "*.prompt", "*.exe", "*.sh", "*.bat", "*.ps1", "*.cmd",
 }
 _BINARY_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
