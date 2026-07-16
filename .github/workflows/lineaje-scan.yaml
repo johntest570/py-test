@@ -41,7 +41,7 @@ jobs:
       - name: Run Lineaje AI policy scan with fix PR
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           TARGET_SHA=$(git -C target-repo rev-parse HEAD)
           python .lineaje-scanner/scripts/gha_repo_scan_fix.py \
