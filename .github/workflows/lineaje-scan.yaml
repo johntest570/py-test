@@ -36,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install mcp
+        run: pip install mcp==1.27.1
 
       - name: Run Lineaje AI policy scan with fix PR
         env:
