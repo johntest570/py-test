@@ -68,8 +68,8 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-# MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
-MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
+MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"
+# MCP_SERVER_URL = "https://mcp.commercialdev.dev.veedna.com/mcp"
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
