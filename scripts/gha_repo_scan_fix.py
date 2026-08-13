@@ -400,7 +400,7 @@ def _run_mcp_scan_via_client(
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                logger.info("MCP step 1/3: get_upload_url")
+                # logger.info("MCP step 1/3: get_upload_url")
                 upload_result = _parse_tool_result(
                     await session.call_tool("get_upload_url", arguments=upload_args)
                 )
@@ -409,7 +409,7 @@ def _run_mcp_scan_via_client(
                 archive_id = upload_result["archive_id"]
                 presigned_url = upload_result["presigned_url"]
 
-        logger.info("MCP step 2/3: upload to S3")
+        # logger.info("MCP step 2/3: upload to S3")
         _upload_to_s3(presigned_url, archive_path)
 
         tok2 = bearer_getter()
@@ -421,7 +421,7 @@ def _run_mcp_scan_via_client(
         ) as (read2, write2, _):
             async with ClientSession(read2, write2) as session2:
                 await session2.initialize()
-                logger.info("MCP step 3/3: analyze_uploaded_archive (timeout=%ds)", sse_timeout)
+                # logger.info("MCP step 3/3: analyze_uploaded_archive (timeout=%ds)", sse_timeout)
                 analyze_args = dict(upload_args)
                 analyze_args["archive_id"] = archive_id
                 result = _parse_tool_result(
